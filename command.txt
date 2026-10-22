@@ -4,3 +4,23 @@ python main.py --datasetname FI_8 --modelname ViT-B/16 --batch_size 32 --num_epo
 
 python test_saved_model.py 20261010093154
 
+
+
+-------------------------------------------------------------
+
+
+# log_s43_labelonly.txt（CE 基线，78.08%，checkpoint 20261016132806）
+python main.py --datasetname FI_8 --modelname ViT-B/16 --batch_size 32 --num_epochs 25 --seed 43 --datadir FI_seed43 --loss ce
+
+# log_s43_labelonly_fal.txt（FAL，77.62%，checkpoint 20261020152509）
+python main.py --datasetname FI_8 --modelname ViT-B/16 --batch_size 32 --num_epochs 25 --seed 43 --datadir FI_seed43 --loss fal
+
+# log_s43_labelonly_listmle.txt（ListMLE，77.40%，checkpoint 20261021130957）
+python main.py --datasetname FI_8 --modelname ViT-B/16 --batch_size 32 --num_epochs 25 --seed 43 --datadir FI_seed43 --loss listmle
+
+
+python test_saved_model.py 20261016132806 --datadir FI_seed43   # CE  → 78.08
+python test_saved_model.py 20261020152509 --datadir FI_seed43   # FAL → 77.62
+python test_saved_model.py 20261021130957 --datadir FI_seed43   # ListMLE → 77.40
+
+-------------------------------------------------------------
