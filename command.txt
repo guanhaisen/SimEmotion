@@ -1,0 +1,6 @@
+.\venv\Scripts\Activate.ps1
+
+python main.py --datasetname FI_8 --modelname ViT-B/16 --batch_size 32 --num_epochs 25
+
+python test_saved_model.py 20261010093154
+
