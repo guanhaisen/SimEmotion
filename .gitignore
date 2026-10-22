@@ -22,9 +22,6 @@ entity_words/
 entity_words_base/
 cate info/
 
-# ===== 备份文件 =====
-*.bak
-
 # ===== IDE =====
 .idea/
 
