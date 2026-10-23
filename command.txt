@@ -24,3 +24,6 @@ python test_saved_model.py 20261020152509 --datadir FI_seed43   # FAL → 77.62
 python test_saved_model.py 20261021130957 --datadir FI_seed43   # ListMLE → 77.40
 
 -------------------------------------------------------------
+
+
+python main.py --datasetname FI_8 --modelname ViT-B/16 --batch_size 32 --num_epochs 25 --seed 43 --datadir FI_seed43 --loss fal_listmle

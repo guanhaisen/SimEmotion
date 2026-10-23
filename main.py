@@ -150,6 +150,20 @@ def get_features(traindataset, valdataset):
     get_features_test(testset)
 
 
+def f1_from_matrix(testResult):
+    """从混淆矩阵计算逐类 F1 与 macro-F1（precision 走列方向，recall 走行方向）"""
+    k = len(testResult)
+    f1s = []
+    for c in range(k):
+        tp = testResult[c][c]
+        col = sum(testResult[i][c] for i in range(k))
+        row = sum(testResult[c])
+        prec = tp / col if col else 0.0
+        rec = tp / row if row else 0.0
+        f1s.append(2 * prec * rec / (prec + rec) if (prec + rec) else 0.0)
+    return f1s, sum(f1s) / k
+
+
 def get_features_test(dataset):
     running_loss = 0.0
     running_corrects = 0
@@ -171,9 +185,11 @@ def get_features_test(dataset):
             running_corrects += torch.sum(preds == labels.data)
         epoch_loss = running_loss / len(dataset)
         epoch_acc = running_corrects.double() / len(dataset)
+        f1s, macro_f1 = f1_from_matrix(testResult)
         print('Answers in testlist:', testResult)  #
-        loginfo = 'Test Loss: {:.4f} Acc: {:.4f}'.format(epoch_loss, epoch_acc)
+        loginfo = 'Test Loss: {:.4f} Acc: {:.4f} macroF1: {:.4f}'.format(epoch_loss, epoch_acc, macro_f1)
         log.append(loginfo + '\n')
+        log.append('PerClassF1: ' + str([round(f, 4) for f in f1s]) + '\n')   # 顺序同 classtype
         log.append(str(testResult))  #
         print(loginfo)
 
@@ -271,6 +287,48 @@ class FALListMLELoss(nn.Module):
         return self.fal(logits, target) + self.mle.lam * (conf * self.mle.listmle_term(logits, target)).mean()
 
 
+class CEFALMLELoss(nn.Module):
+    """无调制三合一：CE + fuzzy项 + λ·ListMLE（三种成分各计一次，排序项不带 p_ŷ 调制）
+    与 fal_listmle 唯一区别是去掉 p_ŷ 置信度调制，构成消融对照——隔离调制的贡献"""
+    def __init__(self, classtype, num_classes=8, lam=0.2):
+        super().__init__()
+        self.fal = FuzzyAwareLoss(num_classes=num_classes)
+        self.mle = ListMLELoss(classtype, lam=lam)
+
+    def forward(self, logits, target):
+        return self.fal(logits, target) + self.mle.lam * self.mle.listmle_term(logits, target).mean()
+
+
+class DistSoftFALLoss(nn.Module):
+    """方案B：情绪距离感知的 FAL——one-hot 标签换成 Mikel 轮距离软标签 q̃_i ∝ exp(-d(i,ŷ)/τ)
+    ℓ = -Σ_i [(1-p_i)·q̃_i + p_i]·log(p_i)，d 即 ECC/EMC 的 W-1（自身 0，同极性 1-3，跨极性 4-7）
+    软标签真值类恒最大，排序约束不与置信度打架；-p·log p 结构不变，有界性保持
+    τ 为温度超参（默认 1.0）：τ 越小软标签越尖，越接近 one-hot"""
+    WHEEL = ['anger', 'amusement', 'contentment', 'awe', 'excitement', 'fear', 'sadness', 'disgust']
+    POS = {'amusement', 'awe', 'contentment', 'excitement'}
+
+    def __init__(self, classtype, tau=1.0):
+        super().__init__()
+        # 距离矩阵 d[i][j] = W(真值类 i, 类别 j) - 1，从官方口径（同极性 1+轮距 / 跨极性 4+轮距）构造
+        k = len(classtype)
+        d = torch.zeros(k, k)
+        for i, a in enumerate(classtype):
+            for j, b in enumerate(classtype):
+                ia, ib = self.WHEEL.index(a), self.WHEEL.index(b)
+                dist = min(abs(ia - ib), k - abs(ia - ib))
+                d[i, j] = dist if (a in self.POS) == (b in self.POS) else 4 + dist
+        soft = F.softmax(-d / tau, dim=1)                     # 行=真值类 y 的软标签 q̃，行和为 1
+        self.register_buffer('soft', soft)
+
+    def forward(self, logits, target):
+        logp = F.log_softmax(logits, dim=1)
+        p = logp.exp()
+        q = self.soft[target]                                 # [B, K] 距离软标签
+        focal_soft = -(logp * (1 - p) * q).sum(1)             # -Σ (1-p_i)·q̃_i·log p_i
+        entropy = -(p * logp).sum(1)                          # -Σ p_i·log p_i（one-hot 时精确退化为 FAL）
+        return (focal_soft + entropy).mean()
+
+
 if __name__ == '__main__':
     # load settings
     parser = argparse.ArgumentParser(description='Image Emotion Classification by SimEmotion')
@@ -288,7 +346,7 @@ if __name__ == '__main__':
     parser.add_argument('--gamma_FC', type=float, default=0.5)
     parser.add_argument('--warmepoch', type=int, default=3)
     parser.add_argument('--datadir', type=str, default=None, help='覆盖 FI_8 数据目录（如 FI_seed43），结尾斜杠可省略')
-    parser.add_argument('--loss', type=str, default='ce', choices=['ce', 'fal', 'listmle', 'fal_listmle'], help='监督损失：ce=交叉熵，fal=fuzzy-aware loss（FAL），listmle=CE+λ·ListMLE情绪序约束，fal_listmle=FAL+λ·p_ŷ·ListMLE组合')
+    parser.add_argument('--loss', type=str, default='ce', choices=['ce', 'fal', 'listmle', 'fal_listmle', 'ce_fal_mle', 'dist_fal'], help='监督损失：ce=交叉熵，fal=fuzzy-aware loss（FAL），listmle=CE+λ·ListMLE情绪序约束，fal_listmle=FAL+λ·p_ŷ·ListMLE组合，ce_fal_mle=CE+模糊项+ListMLE无调制三合一，dist_fal=方案B距离软标签FAL（τ=1.0）')
     args = parser.parse_args()
     if args.datadir and not args.datadir.endswith('/'):
         args.datadir += '/'   # 路径按字符串拼接，结尾斜杠必须补齐
@@ -317,6 +375,10 @@ if __name__ == '__main__':
         criterion = ListMLELoss(classtype).to(device)
     elif args.loss == 'fal_listmle':
         criterion = FALListMLELoss(classtype, num_classes=len(classtype)).to(device)
+    elif args.loss == 'ce_fal_mle':
+        criterion = CEFALMLELoss(classtype, num_classes=len(classtype)).to(device)
+    elif args.loss == 'dist_fal':
+        criterion = DistSoftFALLoss(classtype).to(device)
     else:
         criterion = nn.CrossEntropyLoss()
     optimizer = optim.AdamW(model.visual.parameters(), lr=args.lr_BB, weight_decay=args.wd_BB)
