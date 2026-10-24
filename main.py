@@ -29,6 +29,14 @@ def datasetInit(datasetname):
     if datasetname == 'FI_8':
         _classtype = ['amusement', 'anger', 'awe', 'contentment', 'disgust', 'excitement', 'fear', 'sadness']
         _data_dir = args.datadir or 'D:/Coding/Python_Projects/SimEmotion/FI/'
+    elif datasetname == 'ArtPhoto':
+        # 8 类与 FI_8 同 taxonomy；prepare_artphoto.py 已把 sad 映射为 sadness
+        _classtype = ['amusement', 'anger', 'awe', 'contentment', 'disgust', 'excitement', 'fear', 'sadness']
+        _data_dir = args.datadir or 'D:/Coding/Python_Projects/SimEmotion/artphoto_split/'
+    elif datasetname == 'EmotionROI':
+        # 6 类；joy/surprise 不在 Mikels 8 类 → 仅支持 ce/fal（ListMLE 系与 dist_fal 会报错）
+        _classtype = ['anger', 'disgust', 'fear', 'joy', 'sadness', 'surprise']
+        _data_dir = args.datadir or 'D:/Coding/Python_Projects/SimEmotion/emotionroi_split/'
     else:
         raise InputException
     return _classtype, _data_dir
@@ -54,8 +62,7 @@ class Loaddata(torch.utils.data.Dataset):
     def __init__(self, setname):
         self.images = []
         path = data_dir
-        self.classindex = {'amusement': 0, 'anger': 1, 'awe': 2, 'contentment': 3, 'disgust': 4, 'excitement': 5,
-                           'fear': 6, 'sadness': 7}
+        self.classindex = {c: i for i, c in enumerate(classtype)}   # 动态适配各数据集的类别表
 
         for ct in classtype:
             filepath = path + setname + '/' + ct + '/'
@@ -309,6 +316,9 @@ class DistSoftFALLoss(nn.Module):
 
     def __init__(self, classtype, tau=1.0):
         super().__init__()
+        if any(c not in self.WHEEL for c in classtype):
+            raise ValueError('DistSoftFALLoss 仅支持 Mikels 8 类情绪数据集（FI_8/ArtPhoto/EmoSet），'
+                             'EmotionROI 的 joy/surprise 无情绪距离定义')
         # 距离矩阵 d[i][j] = W(真值类 i, 类别 j) - 1，从官方口径（同极性 1+轮距 / 跨极性 4+轮距）构造
         k = len(classtype)
         d = torch.zeros(k, k)

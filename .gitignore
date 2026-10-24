@@ -7,6 +7,14 @@ venv/
 # ===== 数据集（图片，各约 2.5 GB，不入库）=====
 FI/
 FI_seed43/
+artphoto/
+artphoto_split/
+EmotionROI/
+emotionroi_split/
+
+# ===== 数据集压缩包（原始下载包，可重新下载）=====
+EmotionROI.zip
+testImages_artphoto.zip
 
 # ===== 模型权重（savemodel 训练产物约 4.6 GB + Mask2Former 检测权重）=====
 savemodel/
