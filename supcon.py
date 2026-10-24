@@ -4,6 +4,8 @@
   joint    (默认) : L = CE(fc(features)) + w·SupCon(proj(features))，单循环，
                     与 main.py 七档 loss 臂完全同构（同 warmup/双优化器/调度/best-val），消融对照最公平
   twostage        : 文献标准两阶段——Stage1 SupCon 预训练 backbone+投影头，Stage2 冻结特征用 CE 训分类头
+  pure            : 纯 SupCon——全程无任何 CE 梯度，分类用 kNN（余弦相似度加权投票）评估，
+                    最纯粹地度量对比损失对特征空间的塑造质量（文献标准的非参数评估）
 
 与文献标准 SupCon 的已知偏离（写实验记录时必须注明）:
   - 不加数据增强：本项目所有臂的训练管线均无增强，SupCon 臂保持一致以保臂间公平
@@ -12,6 +14,7 @@
 用法（SimEmotion 目录、venv 激活下）:
   python supcon.py --mode joint --num_epochs 25 --seed 43 --datadir FI_seed43
   python supcon.py --mode twostage --stage1_epochs 25 --stage2_epochs 10 --seed 43 --datadir FI_seed43
+  python supcon.py --mode pure --num_epochs 25 --knn_k 20 --seed 43 --datadir FI_seed43
 
 说明:
   - 复用 main.py 的数据/模型/评估逻辑（import main as M 注入模式，同 test_saved_model.py）；
@@ -78,6 +81,56 @@ class SupConProjector(nn.Module):
         return z / z.norm(dim=-1, keepdim=True)
 
 
+@torch.no_grad()
+def extract_z(model, proj, dataset, batch_size, device):
+    """编码整个数据集，返回投影头输出（已 L2 归一化）的 z [N,128] 与标签 [N]"""
+    model.eval()
+    zs, ys = [], []
+    for images, labels in tqdm(DataLoader(dataset, batch_size=batch_size, shuffle=False)):
+        features = model.encode_image(images.to(device)).float()
+        zs.append(proj(features))
+        ys.append(labels)
+    model.train()
+    return torch.cat(zs), torch.cat(ys)
+
+
+def knn_classify(train_z, train_y, query_z, k):
+    """kNN 分类：余弦相似度加权投票（z 已归一化，内积即余弦）。返回逐查询预测 [N]"""
+    preds = []
+    n_class = int(train_y.max().item()) + 1
+    k = min(k, train_z.size(0))                                    # 防御：k 不得超过训练集大小
+    for i in range(0, query_z.size(0), 1024):                      # 分块防大矩阵爆显存
+        sim = query_z[i:i + 1024] @ train_z.t()                    # [chunk, N_train]
+        topv, topi = sim.topk(k, dim=1)                            # 最近 k 个训练样本
+        votes = torch.zeros(topi.size(0), n_class, device=query_z.device)
+        for c in range(n_class):
+            votes[:, c] = (topv * (train_y[topi] == c)).sum(1)     # 同类邻居相似度求和=加权票
+        preds.append(votes.argmax(1))
+    return torch.cat(preds)
+
+
+def knn_evaluate(model, proj, trainset, query_dataset, classtype, batch_size, device, k, log, prefix):
+    """kNN 评估：从混淆矩阵算 PerClassF1/macroF1，日志格式与 get_features_test 对齐"""
+    train_z, train_y = extract_z(model, proj, trainset, batch_size, device)
+    query_z, query_y = extract_z(model, proj, query_dataset, batch_size, device)
+    preds = knn_classify(train_z, train_y, query_z, k)
+    truth = query_y.to(preds.device)
+    k_len = len(classtype)
+    testResult = [[0] * k_len for _ in range(k_len)]
+    for t, p in zip(truth.cpu().tolist(), preds.cpu().tolist()):
+        testResult[t][p] += 1
+    correct = sum(testResult[i][i] for i in range(k_len))
+    acc = correct / len(truth)
+    f1s, macro_f1 = M.f1_from_matrix(testResult)
+    log.append('PerClassF1: ' + str([round(f, 4) for f in f1s]) + '\n')
+    log.append(str(testResult) + '\n')
+    info = prefix + ' kNN(k={}) Acc: {:.4f} macroF1: {:.4f}'.format(k, acc, macro_f1)
+    log.append(info + '\n')
+    print(info)
+    print('Answers in testlist:', testResult)
+    return acc
+
+
 def run_val(model, fc, criterion, valdataset, batch_size, device):
     """内联验证循环（main.py 同款格式：返回 loss/acc，不打印混淆矩阵）"""
     running_loss = 0.0
@@ -97,11 +150,13 @@ def run_val(model, fc, criterion, valdataset, batch_size, device):
     return epoch_loss, epoch_acc
 
 
-def save_checkpoints(model, fc, proj, tag, datasetname, ts):
-    """supcon 标记插在数据集名之前，避免被 test_saved_model.py 的 modelViT-B-16_FI_8_* 通配误捞"""
+def save_checkpoints(model, fc, proj, tag, datasetname, ts, save_fc=True):
+    """supcon 标记插在数据集名之前，避免被 test_saved_model.py 的 modelViT-B-16_FI_8_* 通配误捞；
+    pure 模式 fc 从未训练，不存（save_fc=False）以免误导"""
     os.makedirs('./savemodel', exist_ok=True)
     torch.save(model.state_dict(), f'./savemodel/model{tag}_{datasetname}_{ts}.pth')
-    torch.save(fc.state_dict(), f'./savemodel/fc{tag}_{datasetname}_{ts}.pth')
+    if save_fc:
+        torch.save(fc.state_dict(), f'./savemodel/fc{tag}_{datasetname}_{ts}.pth')
     torch.save(proj.state_dict(), f'./savemodel/proj{tag}_{datasetname}_{ts}.pth')
 
 
@@ -260,15 +315,68 @@ def train_twostage(args, classtype, device, trainset, valset, testset, model, fc
     M.get_features_test(testset)   # best-val 回载后的最终测试
 
 
+def train_pure(args, classtype, device, trainset, valset, testset, model, proj, log):
+    """纯 SupCon 模式：全程无 CE 梯度，kNN 评估。训练循环同 twostage Stage1，
+    每轮用 val kNN acc 做 best-val 选择（kNN 需重编码训练集，~1min/轮）"""
+    supcon_criterion = SupConLoss(temperature=args.temperature)
+    optimizer = torch.optim.AdamW(model.visual.parameters(), lr=args.lr_BB, weight_decay=1e-5)
+    optimizer_proj = torch.optim.Adam(proj.parameters(), lr=args.lr_FC)
+    scheduler = lr_scheduler.StepLR(optimizer, step_size=args.stepsize_BB, gamma=args.gamma_BB)
+    scheduler_proj = lr_scheduler.StepLR(optimizer_proj, step_size=args.stepsize_FC, gamma=args.gamma_FC)
+
+    topacc = 0.0
+    best_model = copy.deepcopy(model.state_dict())
+    best_proj = copy.deepcopy(proj.state_dict())
+
+    for epoch in range(args.num_epochs):
+        running_loss = 0.0
+        for images, labels in tqdm(DataLoader(trainset, batch_size=args.batch_size, shuffle=True)):
+            images = images.to(device)
+            labels = labels.to(device)
+            optimizer.zero_grad()
+            optimizer_proj.zero_grad()
+            with torch.set_grad_enabled(True):
+                features = model.encode_image(images).float()
+                loss = supcon_criterion(proj(features), labels)
+                loss.backward()
+                M.convert_models_to_fp32(model.visual)
+                optimizer.step()
+                clip.model.convert_weights(model.visual)
+                optimizer_proj.step()
+            running_loss += loss.item() * features.size(0)
+        loginfo = 'SupCon Epoch:{} Loss: {:.4f}'.format(epoch, running_loss / len(trainset))
+        log.append(loginfo + '\n')
+        print(loginfo)
+        scheduler.step()
+        scheduler_proj.step()
+
+        # 每轮 val kNN（best-val 选择，与其他臂的 best-val 机制对齐）
+        valacc = knn_evaluate(model, proj, trainset, valset, classtype,
+                              args.batch_size, device, args.knn_k, log,
+                              prefix='Val@Epoch:{}'.format(epoch))
+        if valacc > topacc:
+            topacc = valacc
+            best_model = copy.deepcopy(model.state_dict())
+            best_proj = copy.deepcopy(proj.state_dict())
+        log.append('topacc: ' + str(topacc) + '\n')
+        print('topacc: ' + str(topacc))
+
+    model.load_state_dict(best_model)
+    proj.load_state_dict(best_proj)
+    knn_evaluate(model, proj, trainset, testset, classtype,
+                 args.batch_size, device, args.knn_k, log, prefix='FinalTest')
+
+
 def main():
     parser = argparse.ArgumentParser(description='Supervised Contrastive Loss experiments for SimEmotion')
     parser.add_argument('--datasetname', type=str, default='FI_8')
     parser.add_argument('--modelname', type=str, default='ViT-B/16', help='仅支持 ViT-B/16（fcdim=512）')
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--seed', type=int, default=43)
-    parser.add_argument('--mode', type=str, default='joint', choices=['joint', 'twostage'],
-                        help='joint=CE+w·SupCon 联合单循环；twostage=SupCon 预训练+CE 两阶段')
-    parser.add_argument('--num_epochs', type=int, default=25, help='joint 模式总轮数')
+    parser.add_argument('--mode', type=str, default='joint', choices=['joint', 'twostage', 'pure'],
+                        help='joint=CE+w·SupCon 联合单循环；twostage=SupCon 预训练+CE 两阶段；pure=纯 SupCon+kNN 评估')
+    parser.add_argument('--knn_k', type=int, default=20, help='pure 模式 kNN 的邻居数 k')
+    parser.add_argument('--num_epochs', type=int, default=25, help='joint/pure 模式总轮数')
     parser.add_argument('--stage1_epochs', type=int, default=25, help='twostage 阶段一（SupCon 预训练）轮数')
     parser.add_argument('--stage2_epochs', type=int, default=10, help='twostage 阶段二（CE 训 fc）轮数')
     parser.add_argument('--temperature', type=float, default=0.07, help='SupCon 温度 τ')
@@ -320,17 +428,21 @@ def main():
     if args.mode == 'joint':
         train_joint(args, classtype, device, trainset, valset, testset, model, fc, proj, log)
         tag = 'supconjoint'
-    else:
+    elif args.mode == 'twostage':
         train_twostage(args, classtype, device, trainset, valset, testset, model, fc, proj, log)
         tag = 'supcon2stage'
+    else:
+        train_pure(args, classtype, device, trainset, valset, testset, model, proj, log)
+        tag = 'supconpure'
 
     endpoint = time.time()
     print('cost: ' + str(endpoint - startpoint) + 's.')
 
-    # ---- 存 checkpoint（三件套）+ 日志 ----
-    save_checkpoints(model, fc, proj, tag, args.datasetname, starttime)
+    # ---- 存 checkpoint（pure 模式 fc 未训练不存）+ 日志 ----
+    save_checkpoints(model, fc, proj, tag, args.datasetname, starttime, save_fc=(args.mode != 'pure'))
     paraminfo = args.modelname + '_' + args.datasetname + ' loss:supcon_' + args.mode \
                 + ' tau:' + str(args.temperature) + ' w:' + str(args.supcon_weight) \
+                + ' knn_k:' + str(args.knn_k) \
                 + ' lr_FC:' + str(args.lr_FC) + ' stepsize_FC:' + str(args.stepsize_FC) \
                 + ' gamma_FC' + str(args.gamma_FC) + ' lr_BB:' + str(args.lr_BB) \
                 + ' stepsize_BB:' + str(args.stepsize_BB) + ' gamma_BB' + str(args.gamma_BB) \
@@ -339,7 +451,7 @@ def main():
     print(paraminfo)
     log.append(paraminfo + '\n')
     os.makedirs('./log', exist_ok=True)
-    with open('./log/supcon' + ('joint' if args.mode == 'joint' else '2stage') + '_' + args.datasetname + '_' + str(starttime) + '.txt', 'a+') as flog:
+    with open('./log/' + tag + '_' + args.datasetname + '_' + str(starttime) + '.txt', 'a+') as flog:
         for line in log:
             flog.write(str(line))
         print('Log saved successfully.')
