@@ -356,7 +356,7 @@ if __name__ == '__main__':
     parser.add_argument('--gamma_FC', type=float, default=0.5)
     parser.add_argument('--warmepoch', type=int, default=3)
     parser.add_argument('--datadir', type=str, default=None, help='覆盖 FI_8 数据目录（如 FI_seed43），结尾斜杠可省略')
-    parser.add_argument('--loss', type=str, default='ce', choices=['ce', 'fal', 'listmle', 'fal_listmle', 'ce_fal_mle', 'dist_fal'], help='监督损失：ce=交叉熵，fal=fuzzy-aware loss（FAL），listmle=CE+λ·ListMLE情绪序约束，fal_listmle=FAL+λ·p_ŷ·ListMLE组合，ce_fal_mle=CE+模糊项+ListMLE无调制三合一，dist_fal=方案B距离软标签FAL（τ=1.0）')
+    parser.add_argument('--loss', type=str, default='ce', choices=['ce', 'fal', 'listmle', 'fal_listmle', 'ce_fal_mle', 'dist_fal', 'wce'], help='监督损失：ce=交叉熵，fal=fuzzy-aware loss（FAL），listmle=CE+λ·ListMLE情绪序约束，fal_listmle=FAL+λ·p_ŷ·ListMLE组合，ce_fal_mle=CE+模糊项+ListMLE无调制三合一，dist_fal=方案B距离软标签FAL（τ=1.0），wce=类频率倒数加权CE（PaCo哨兵臂）')
     args = parser.parse_args()
     if args.datadir and not args.datadir.endswith('/'):
         args.datadir += '/'   # 路径按字符串拼接，结尾斜杠必须补齐
@@ -389,6 +389,12 @@ if __name__ == '__main__':
         criterion = CEFALMLELoss(classtype, num_classes=len(classtype)).to(device)
     elif args.loss == 'dist_fal':
         criterion = DistSoftFALLoss(classtype).to(device)
+    elif args.loss == 'wce':
+        # 类频率倒数加权 CE（sklearn balanced 口径）：w_c = N / (K·n_c)，均值 1；少数类梯度话语权提升
+        counts = [sum(1 for _, l in trainset.images if l == c) for c in classtype]
+        N = sum(counts)
+        w = torch.tensor([N / (len(classtype) * n) if n else 0.0 for n in counts], dtype=torch.float32)
+        criterion = nn.CrossEntropyLoss(weight=w).to(device)
     else:
         criterion = nn.CrossEntropyLoss()
     optimizer = optim.AdamW(model.visual.parameters(), lr=args.lr_BB, weight_decay=args.wd_BB)
