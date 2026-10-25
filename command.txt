@@ -27,3 +27,12 @@ python test_saved_model.py 20261021130957 --datadir FI_seed43   # ListMLE → 77
 
 
 python main.py --datasetname FI_8 --modelname ViT-B/16 --batch_size 32 --num_epochs 25 --seed 43 --datadir FI_seed43 --loss fal_listmle
+
+
+
+
+---------------------------------------------------------------------
+
+
+
+python supcon.py --mode twostage --stage1_ckpt 20261025093610 --stage2_epochs 10 --seed 43 --datadir FI_seed43

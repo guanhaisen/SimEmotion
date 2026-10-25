@@ -171,7 +171,7 @@ def f1_from_matrix(testResult):
     return f1s, sum(f1s) / k
 
 
-def get_features_test(dataset):
+def get_features_test(dataset, prefix='Test'):
     running_loss = 0.0
     running_corrects = 0
     testResult = [[0 for col in range(len(classtype))] for row in range(len(classtype))]  #
@@ -194,7 +194,7 @@ def get_features_test(dataset):
         epoch_acc = running_corrects.double() / len(dataset)
         f1s, macro_f1 = f1_from_matrix(testResult)
         print('Answers in testlist:', testResult)  #
-        loginfo = 'Test Loss: {:.4f} Acc: {:.4f} macroF1: {:.4f}'.format(epoch_loss, epoch_acc, macro_f1)
+        loginfo = prefix + ' Loss: {:.4f} Acc: {:.4f} macroF1: {:.4f}'.format(epoch_loss, epoch_acc, macro_f1)
         log.append(loginfo + '\n')
         log.append('PerClassF1: ' + str([round(f, 4) for f in f1s]) + '\n')   # 顺序同 classtype
         log.append(str(testResult))  #

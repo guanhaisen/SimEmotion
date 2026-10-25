@@ -97,6 +97,7 @@ def extract_z(model, proj, dataset, batch_size, device):
 def knn_classify(train_z, train_y, query_z, k):
     """kNN 分类：余弦相似度加权投票（z 已归一化，内积即余弦）。返回逐查询预测 [N]"""
     preds = []
+    train_y = train_y.to(train_z.device)                           # 标签搬到与 z 同设备，避免跨设备索引报错
     n_class = int(train_y.max().item()) + 1
     k = min(k, train_z.size(0))                                    # 防御：k 不得超过训练集大小
     for i in range(0, query_z.size(0), 1024):                      # 分块防大矩阵爆显存
@@ -109,9 +110,12 @@ def knn_classify(train_z, train_y, query_z, k):
     return torch.cat(preds)
 
 
-def knn_evaluate(model, proj, trainset, query_dataset, classtype, batch_size, device, k, log, prefix):
-    """kNN 评估：从混淆矩阵算 PerClassF1/macroF1，日志格式与 get_features_test 对齐"""
-    train_z, train_y = extract_z(model, proj, trainset, batch_size, device)
+def knn_evaluate(model, proj, trainset, query_dataset, classtype, batch_size, device, k, log, prefix, train_feats=None):
+    """kNN 评估：从混淆矩阵算 PerClassF1/macroF1，日志格式与 get_features_test 对齐。
+    train_feats 可传入已编码的训练集 (z, y) 以避免同一模型下重复编码（每轮 val+test 共用）"""
+    if train_feats is None:
+        train_feats = extract_z(model, proj, trainset, batch_size, device)
+    train_z, train_y = train_feats
     query_z, query_y = extract_z(model, proj, query_dataset, batch_size, device)
     preds = knn_classify(train_z, train_y, query_z, k)
     truth = query_y.to(preds.device)
@@ -243,32 +247,49 @@ def train_twostage(args, classtype, device, trainset, valset, testset, model, fc
     criterion = nn.CrossEntropyLoss()
 
     # ---- Stage1: SupCon 预训练（无 CE 无 fc，无 warmup——SupCon 直接塑形特征）----
-    optimizer = torch.optim.AdamW(model.visual.parameters(), lr=args.lr_BB, weight_decay=1e-5)
-    optimizer_proj = torch.optim.Adam(proj.parameters(), lr=args.lr_FC)
-    scheduler = lr_scheduler.StepLR(optimizer, step_size=args.stepsize_BB, gamma=args.gamma_BB)
-    scheduler_proj = lr_scheduler.StepLR(optimizer_proj, step_size=args.stepsize_FC, gamma=args.gamma_FC)
-
-    for epoch in range(args.stage1_epochs):
-        running_loss = 0.0
-        for images, labels in tqdm(DataLoader(trainset, batch_size=args.batch_size, shuffle=True)):
-            images = images.to(device)
-            labels = labels.to(device)
-            optimizer.zero_grad()
-            optimizer_proj.zero_grad()
-            with torch.set_grad_enabled(True):
-                features = model.encode_image(images).float()
-                loss = supcon_criterion(proj(features), labels)
-                loss.backward()
-                M.convert_models_to_fp32(model.visual)
-                optimizer.step()
-                clip.model.convert_weights(model.visual)
-                optimizer_proj.step()
-            running_loss += loss.item() * features.size(0)
-        loginfo = 'Stage1 SupCon Epoch:{} Loss: {:.4f}'.format(epoch, running_loss / len(trainset))
+    # --stage1_ckpt 传入时间戳时跳过训练，直接加载已完成的 SupCon 预训练权重
+    # （如 pure 模式产物；训练循环与 Stage1 数学上等价，省 25 轮 ~1.8h。
+    #   注意：pure 存的是 best-val kNN 权重，与朴素 twostage 的"末轮权重"略不同，属协议偏差需注明）
+    if args.stage1_ckpt:
+        import glob
+        hits_m = glob.glob('./savemodel/model*_' + args.datasetname + '_' + args.stage1_ckpt + '.pth')
+        hits_p = glob.glob('./savemodel/proj*_' + args.datasetname + '_' + args.stage1_ckpt + '.pth')
+        if not hits_m or not hits_p:
+            raise FileNotFoundError(
+                'Stage1 checkpoint not found: need model*/proj* pair for dataset '
+                + args.datasetname + ' ts=' + args.stage1_ckpt)
+        model.load_state_dict(torch.load(hits_m[0], map_location='cpu'))
+        proj.load_state_dict(torch.load(hits_p[0], map_location='cpu'))
+        loginfo = 'Stage1 loaded from checkpoint: ' + hits_m[0] + ' (skip training)'
         log.append(loginfo + '\n')
         print(loginfo)
-        scheduler.step()
-        scheduler_proj.step()
+    else:
+        optimizer = torch.optim.AdamW(model.visual.parameters(), lr=args.lr_BB, weight_decay=1e-5)
+        optimizer_proj = torch.optim.Adam(proj.parameters(), lr=args.lr_FC)
+        scheduler = lr_scheduler.StepLR(optimizer, step_size=args.stepsize_BB, gamma=args.gamma_BB)
+        scheduler_proj = lr_scheduler.StepLR(optimizer_proj, step_size=args.stepsize_FC, gamma=args.gamma_FC)
+
+        for epoch in range(args.stage1_epochs):
+            running_loss = 0.0
+            for images, labels in tqdm(DataLoader(trainset, batch_size=args.batch_size, shuffle=True)):
+                images = images.to(device)
+                labels = labels.to(device)
+                optimizer.zero_grad()
+                optimizer_proj.zero_grad()
+                with torch.set_grad_enabled(True):
+                    features = model.encode_image(images).float()
+                    loss = supcon_criterion(proj(features), labels)
+                    loss.backward()
+                    M.convert_models_to_fp32(model.visual)
+                    optimizer.step()
+                    clip.model.convert_weights(model.visual)
+                    optimizer_proj.step()
+                running_loss += loss.item() * features.size(0)
+            loginfo = 'Stage1 SupCon Epoch:{} Loss: {:.4f}'.format(epoch, running_loss / len(trainset))
+            log.append(loginfo + '\n')
+            print(loginfo)
+            scheduler.step()
+            scheduler_proj.step()
 
     # ---- Stage2: backbone 冻结，纯 CE 训 fc（文献标准）----
     model.eval()
@@ -303,13 +324,18 @@ def train_twostage(args, classtype, device, trainset, valset, testset, model, fc
         print(loginfo)
         scheduler_fc.step()
 
-        # 用 M.get_features_test 评估 val（重编码开销可接受，换日志格式完全统一）
-        epoch_accval = M.get_features_test(valset)
+        # 用 M.get_features_test 评估 val（重编码开销可接受，换日志格式完全统一；prefix='Val' 区分 test 行）
+        epoch_accval = M.get_features_test(valset, prefix='Val')
         if epoch_accval > topacc:
             topacc = epoch_accval
             best_fc = copy.deepcopy(fc.state_dict())
         log.append('Stage2 topacc: ' + str(topacc) + '\n')
         print('Stage2 topacc: ' + str(topacc))
+        # 每轮用当前模型在测试集上评估一次（仅记录曲线，模型选择仍以 val 为准，与 joint/pure 口径一致）
+        testacc = M.get_features_test(testset)
+        epoctestinfo = 'Stage2 Test@Epoch:{} Acc: {:.4f}'.format(epoch, testacc)
+        log.append(epoctestinfo + '\n')
+        print(epoctestinfo)
 
     fc.load_state_dict(best_fc)
     M.get_features_test(testset)   # best-val 回载后的最终测试
@@ -317,7 +343,7 @@ def train_twostage(args, classtype, device, trainset, valset, testset, model, fc
 
 def train_pure(args, classtype, device, trainset, valset, testset, model, proj, log):
     """纯 SupCon 模式：全程无 CE 梯度，kNN 评估。训练循环同 twostage Stage1，
-    每轮用 val kNN acc 做 best-val 选择（kNN 需重编码训练集，~1min/轮）"""
+    每轮 val+test kNN 双评估（训练集编码一次共用），best-val 选择只看 val（test 仅观察）"""
     supcon_criterion = SupConLoss(temperature=args.temperature)
     optimizer = torch.optim.AdamW(model.visual.parameters(), lr=args.lr_BB, weight_decay=1e-5)
     optimizer_proj = torch.optim.Adam(proj.parameters(), lr=args.lr_FC)
@@ -350,16 +376,20 @@ def train_pure(args, classtype, device, trainset, valset, testset, model, proj, 
         scheduler.step()
         scheduler_proj.step()
 
-        # 每轮 val kNN（best-val 选择，与其他臂的 best-val 机制对齐）
+        # 每轮 val + test kNN：训练集只编码一次共用；test 仅观察不参与 checkpoint 选择（与 main.py 七档臂口径一致）
+        train_feats = extract_z(model, proj, trainset, args.batch_size, device)
         valacc = knn_evaluate(model, proj, trainset, valset, classtype,
                               args.batch_size, device, args.knn_k, log,
-                              prefix='Val@Epoch:{}'.format(epoch))
+                              prefix='Val@Epoch:{}'.format(epoch), train_feats=train_feats)
         if valacc > topacc:
             topacc = valacc
             best_model = copy.deepcopy(model.state_dict())
             best_proj = copy.deepcopy(proj.state_dict())
         log.append('topacc: ' + str(topacc) + '\n')
         print('topacc: ' + str(topacc))
+        knn_evaluate(model, proj, trainset, testset, classtype,
+                     args.batch_size, device, args.knn_k, log,
+                     prefix='Test@Epoch:{}'.format(epoch), train_feats=train_feats)
 
     model.load_state_dict(best_model)
     proj.load_state_dict(best_proj)
@@ -379,6 +409,9 @@ def main():
     parser.add_argument('--num_epochs', type=int, default=25, help='joint/pure 模式总轮数')
     parser.add_argument('--stage1_epochs', type=int, default=25, help='twostage 阶段一（SupCon 预训练）轮数')
     parser.add_argument('--stage2_epochs', type=int, default=10, help='twostage 阶段二（CE 训 fc）轮数')
+    parser.add_argument('--stage1_ckpt', type=str, default=None,
+                        help='twostage 跳过 Stage1：加载已有 SupCon 预训练 checkpoint（传时间戳如 20261025093610，'
+                             '需存在 model*/proj* 同戳两件套；须与当前 seed/数据划分一致')
     parser.add_argument('--temperature', type=float, default=0.07, help='SupCon 温度 τ')
     parser.add_argument('--supcon_weight', type=float, default=0.5, help='joint 模式 SupCon 项权重 w')
     parser.add_argument('--lr_BB', type=float, default=1e-6)
