@@ -9,10 +9,10 @@
   genscl          : 广义监督对比损失（GenSCL, Kim et al. arXiv:2206.00384 Eq.2）忠实复刻，
                     训练骨架与 joint 完全一致，仅把 SupCon 项换成"标签相似度 × 特征相似度交叉熵"
                     （one-hot 标签下与 SupCon 的唯一数学差异：逐 anchor 归一化 1/|A(i)| vs 1/|P(i)|）
-  paco            : 参数化对比学习（PaCo, Cui et al., ICCV 2021 Eq.4+Eq.8）—— SupCon 基础上引入
-                    每类一个可学习中心：中心作为额外正对（权重 1.0，样本正对权重 α）进入分子，
-                    分母纳入全部中心并按类频率 q(y_k) 加权（Balanced Softmax 仅作用于中心学习）。
-                    骨架与 joint 完全一致（CE + w·PaCo），中心参数并入 proj 优化器组
+  paco            : 官方口径 PaCo 单损失（Cui et al., ICCV 2021；实现与官方 PaCo/LT/losses.py 逐项对齐）——
+                    中心 = fc 分类器权重，Balanced Softmax 内嵌于中心项（分母/分子均含 log q 类频率），
+                    总损失 L = PaCo(proj(features), labels, fc(features))，无独立 CE、无 w 乘子；
+                    训练骨架仍与 joint 一致（warmup/双优化器/best-val/每轮 test）
 
 与文献标准 SupCon 的已知偏离（写实验记录时必须注明）:
   - 不加数据增强：本项目所有臂的训练管线均无增强，SupCon 臂保持一致以保臂间公平
@@ -104,49 +104,49 @@ class GenSCLLoss(nn.Module):
 
 
 class PaCoLoss(nn.Module):
-    """PaCo 损失（Cui et al., ICCV 2021 式(4)+式(8)，q 加权方向经期刊版 GPaCo 式(8)与官方代码双重核对）
-    L_i = -1/W_i [ α·Σ_{p∈P(i)} log(ψ(z_p)/Den) + 1.0·log(ψ(c_y)/Den) ]
-      其中 w(z+)=α（样本正对）/ 1.0（中心正对）——见论文附录式(14)：中心项系数 1，样本项系数 α
-      ψ(z_k) = exp(z_k·g_i/τ)                              z_k ∈ A(i)（样本项不加权）
-      ψ(z_k) = exp(z_k·g_i/τ)·q(y_k)                       z_k ∈ C（Balanced Softmax 仅加权中心项，q=类频率）
-      W_i = α·|P(i)| + 1.0（按 Σw(z+) 缩放，论文实现说明）
-    中心正对项分子同含 q(y)：ψ(c_y)=exp(c_y·g_i/τ)·q(y)（与官方实现一致；log q(y) 为常数，只平移损失值不影响梯度）
-    与文献的偏离（写实验记录时必须注明）:
-      - 中心是独立可学习参数（ICCV 原文设定）；官方 GPaCo 代码将其简化为复用 fc 权重，本实现取原文口径
-      - 中心在 forward 内 L2 归一化与样本同尺度（原文未规定中心尺度；不归一化则 randn 初始化下 c·g 量级
-        ~sqrt(dim) 会淹没对比项）；τ 沿用本脚本 joint 臂默认 0.07（论文原为 0.2）
-      - batch 版：A(i)=batch 内除自身外全部样本（无 queue/动量编码器/两视角增强，同 joint 臂口径）
-      - 每个 anchor 至少有自己类的中心一个正对，SupCon 的孤立样本 valid 掩码不再需要
-      - 总损失仍为 CE + w·PaCo（joint 骨架口径）；论文原框架无独立 CE 项，中心学习重平衡内嵌于式(8)
-    输入特征须已 L2 归一化；返回标量（batch 均值）"""
-    def __init__(self, temperature=0.07, alpha=0.05, num_classes=8, q=None, feat_dim=128):
+    """官方口径 PaCo 单损失（Cui et al., ICCV 2021；与官方 PaCo/LT/losses.py PaCoLoss 逐项对齐，K=0 batch 版）
+    中心 = fc 分类器权重：经 sup_logits = fc(penultimate 未归一化特征) 传入（官方 --normalize 默认 False，
+    与本项目评估路径 get_features_test 的 fc(encode_image) 完全一致）；样本对比在 proj 空间（已归一化）。
+    L_i = -1/W_i [ β·log(ψ(c_y)/Den) + α·Σ_{p∈P(i)} log(ψ(z_p)/Den) ]
+      ψ(c_k) = exp(fc_k(x_i) + log q(y_k))    ← Balanced Softmax 内嵌于中心/分类器项（官方 sup_logits+log(weight)）
+      ψ(z_p) = exp(z_p·g_i/τ)                 ← 样本项不加权（官方 γ=1）
+      Den   = Σ_k ψ(c_k) + Σ_{z∈A(i)} ψ(z)    （全部中心 + batch 内除自身外全部样本）
+      W_i   = β + α·|P(i)|（官方 /mask.sum(1)，β=1）
+    总损失 = PaCo 单损失：无独立 CE、无 w 乘子（官方 loss = criterion(features, labels, logits) 单行）
+    性质：
+      - α=0 时样本正对归零、损失趋近 BS-CE（分母仍含样本项，非严格退化——官方同此行为，已与官方实现对拍验证）
+      - 中心正对分子同含 +log q_y（与官方一致；log q 为常数，只平移损失值不影响梯度）
+      - 每个 anchor 至少有本类中心一个正对，无孤立样本问题
+    与官方的偏离：无 queue/动量编码器/两视角增强（batch 版，同本脚本其他臂口径）；warmup 沿用本脚本骨架
+    （warmup 期间 backbone 冻结，fc=中心与 proj 照常训练——分类器从第 0 轮即受 BS 校正）
+    输入：features_proj 已 L2 归一化 [B,d]；sup_logits = fc(未归一化 penultimate) [B,C]；返回标量（batch 均值）"""
+    def __init__(self, temperature=0.07, alpha=0.05, beta=1.0, gamma=1.0, num_classes=8, q=None):
         super().__init__()
         self.tau = temperature
         self.alpha = alpha
-        self.register_buffer('log_q', torch.log(q.clamp(min=1e-9)))   # [C] log 类频率，BS 加权
-        self.centers = nn.Parameter(torch.randn(num_classes, feat_dim) * 0.02)
+        self.beta = beta
+        self.gamma = gamma
+        self.register_buffer('log_q', torch.log(q.clamp(min=1e-9)))   # [C] log 类频率，BS 内嵌
 
-    def forward(self, features, labels):
-        centers = self.centers / self.centers.norm(dim=-1, keepdim=True)   # 与归一化样本同尺度
-        b = features.size(0)
-        sim = features @ features.t() / self.tau                           # [B,B] 样本-样本
-        c_sim = features @ centers.t() / self.tau                          # [B,C] 样本-中心
-        logits_max = torch.cat([sim, c_sim], dim=1).max(dim=1, keepdim=True).values.detach()
-        sim = sim - logits_max                                             # 逐行减 max，数值稳定
-        c_sim = c_sim - logits_max
-        eye = torch.eye(b, dtype=torch.bool, device=features.device)
-        # 分母 Den = Σ_{样本} exp + Σ_{中心} q(y_k)·exp，log 域分两段 logsumexp 再合并
-        log_den_sample = torch.logsumexp(sim.masked_fill(eye, float('-inf')), dim=1)
-        log_den_center = torch.logsumexp(c_sim + self.log_q, dim=1)        # [B]
-        log_den = torch.logsumexp(torch.stack([log_den_sample, log_den_center], dim=1), dim=1)
-        # 样本正对项（权重 α）：Σ_{p∈P(i)} log[exp(sim_ip/τ)/Den]
-        pos_mask = (labels.unsqueeze(0) == labels.unsqueeze(1)) & ~eye
-        log_prob_pos = (sim - log_den.unsqueeze(1)).masked_fill(eye, 0.0)
-        sample_term = (log_prob_pos * pos_mask.float()).sum(1)
-        # 中心正对项（权重 1.0）：log[exp(c_y·g_i/τ)·q(y)/Den]
-        center_term = c_sim.gather(1, labels.view(-1, 1)).squeeze(1) + self.log_q[labels] - log_den
-        w_sum = self.alpha * pos_mask.sum(1) + 1.0
-        return (-(self.alpha * sample_term + center_term) / w_sum).mean()
+    def forward(self, features_proj, labels, sup_logits):
+        b = features_proj.size(0)
+        n_class = sup_logits.size(1)
+        sample_logits = features_proj @ features_proj.t() / self.tau          # [B,B] 样本-样本（proj 空间）
+        center_logits = sup_logits + self.log_q.unsqueeze(0)                  # [B,C] BS 内嵌（supt=1）
+        logits = torch.cat([center_logits, sample_logits], dim=1)
+        logits = logits - logits.max(dim=1, keepdim=True).values.detach()     # 逐行减 max，数值稳定
+        eye = torch.eye(b, dtype=torch.bool, device=features_proj.device)
+        eye_f = eye.float()
+        # 分子掩码：中心部分 β·one_hot（γ 无关）；样本部分 α·同类且非自身
+        pos_mask = torch.cat([self.beta * F.one_hot(labels, num_classes=n_class).float(),
+                              self.alpha * (labels.unsqueeze(0) == labels.unsqueeze(1)).float() * (1.0 - eye_f)],
+                             dim=1)
+        # 分母掩码：中心全部参与（γ 对中心为 1）；样本除自身外全部参与（权重 γ=1）
+        den_mask = torch.cat([torch.ones(b, n_class, device=features_proj.device), 1.0 - eye_f], dim=1)
+        log_den = torch.logsumexp(logits.masked_fill(den_mask == 0, float('-inf')), dim=1, keepdim=True)
+        log_prob = logits - log_den
+        loss_i = -(pos_mask * log_prob).sum(1) / pos_mask.sum(1)
+        return loss_i.mean()
 
 
 class SupConProjector(nn.Module):
@@ -237,42 +237,38 @@ def run_val(model, fc, criterion, valdataset, batch_size, device):
     return epoch_loss, epoch_acc
 
 
-def save_checkpoints(model, fc, proj, tag, datasetname, ts, save_fc=True, centers=None):
+def save_checkpoints(model, fc, proj, tag, datasetname, ts, save_fc=True):
     """supcon 标记插在数据集名之前，避免被 test_saved_model.py 的 modelViT-B-16_FI_8_* 通配误捞；
     pure 模式 fc 从未训练，不存（save_fc=False）以免误导；
-    paco 模式额外存中心参数 center{tag}_*.pth（PaCoLoss 的 centers 参数 + log_q buffer）"""
+    paco 模式中心=fc 权重，fc 三件套已覆盖，无需额外中心文件"""
     os.makedirs('./savemodel', exist_ok=True)
     torch.save(model.state_dict(), f'./savemodel/model{tag}_{datasetname}_{ts}.pth')
     if save_fc:
         torch.save(fc.state_dict(), f'./savemodel/fc{tag}_{datasetname}_{ts}.pth')
     torch.save(proj.state_dict(), f'./savemodel/proj{tag}_{datasetname}_{ts}.pth')
-    if centers is not None:
-        torch.save(centers.state_dict(), f'./savemodel/center{tag}_{datasetname}_{ts}.pth')
 
 
 def train_joint(args, classtype, device, trainset, valset, testset, model, fc, proj, log):
     """联合模式：L = CE + w·SupCon 单循环，骨架与 main.py get_features 一致；
     genscl 模式复用同一骨架，仅把对比项从 SupConLoss 换成 GenSCLLoss（Eq.2 复刻）；
-    paco 模式复用同一骨架，对比项换成 PaCoLoss（中心参数并入 proj 优化器组，随 best-val 一起选择）"""
+    paco 模式为官方口径单损失：L = PaCo(proj(features), labels, fc(features))，无独立 CE、无 w
+    （中心=fc 权重、BS 内嵌；PaCoLoss 无可学习参数，fc 仍由 optimizer_fc 按原口径优化）"""
     criterion = nn.CrossEntropyLoss()
     paco = None
     if args.mode == 'genscl':
         supcon_criterion = GenSCLLoss(temperature=args.temperature)
     elif args.mode == 'paco':
-        # 类频率 q(y) = n_c/N（与 main.py wce 哨兵臂同口径），Balanced Softmax 加权中心学习
+        # 类频率 q(y) = n_c/N（与 main.py wce 哨兵臂同口径），Balanced Softmax 内嵌于中心=fc 项
         counts = [sum(1 for _, l in trainset.images if l == c) for c in classtype]
         q = torch.tensor([n / max(sum(counts), 1) for n in counts], dtype=torch.float32)
         paco = PaCoLoss(temperature=args.temperature, alpha=args.paco_alpha,
-                        num_classes=len(classtype), q=q, feat_dim=128).to(device)
+                        num_classes=len(classtype), q=q).to(device)
         supcon_criterion = paco
     else:
         supcon_criterion = SupConLoss(temperature=args.temperature)
     optimizer = torch.optim.AdamW(model.visual.parameters(), lr=args.lr_BB, weight_decay=1e-5)
     optimizer_fc = torch.optim.Adam(fc.parameters(), lr=args.lr_FC)
-    proj_params = list(proj.parameters())
-    if paco is not None:
-        proj_params += list(paco.parameters())   # 中心参数按 FC 头口径优化
-    optimizer_proj = torch.optim.Adam(proj_params, lr=args.lr_FC)
+    optimizer_proj = torch.optim.Adam(proj.parameters(), lr=args.lr_FC)
     scheduler = lr_scheduler.StepLR(optimizer, step_size=args.stepsize_BB, gamma=args.gamma_BB)
     scheduler_fc = lr_scheduler.StepLR(optimizer_fc, step_size=args.stepsize_FC, gamma=args.gamma_FC)
     scheduler_proj = lr_scheduler.StepLR(optimizer_proj, step_size=args.stepsize_FC, gamma=args.gamma_FC)
@@ -281,7 +277,6 @@ def train_joint(args, classtype, device, trainset, valset, testset, model, fc, p
     best_model = copy.deepcopy(model.state_dict())
     best_fc = copy.deepcopy(fc.state_dict())
     best_proj = copy.deepcopy(proj.state_dict())
-    best_paco = copy.deepcopy(paco.state_dict()) if paco is not None else None
 
     for epoch in range(args.num_epochs):
         running_loss = 0.0
@@ -296,9 +291,13 @@ def train_joint(args, classtype, device, trainset, valset, testset, model, fc, p
             with torch.set_grad_enabled(True):
                 features = model.encode_image(images).float()
                 outputs = fc(features)
-                ce = criterion(outputs, labels)
-                sup = supcon_criterion(proj(features), labels)
-                loss = ce + args.supcon_weight * sup
+                if args.mode == 'paco':
+                    # 官方口径 PaCo 单损失：中心=fc 权重、BS 内嵌，无独立 CE、无 w
+                    loss = supcon_criterion(proj(features), labels, outputs)
+                else:
+                    ce = criterion(outputs, labels)
+                    sup = supcon_criterion(proj(features), labels)
+                    loss = ce + args.supcon_weight * sup
                 _, preds = torch.max(outputs, 1)
                 loss.backward()
                 if epoch >= args.warmepoch:
@@ -327,8 +326,6 @@ def train_joint(args, classtype, device, trainset, valset, testset, model, fc, p
             best_model = copy.deepcopy(model.state_dict())
             best_fc = copy.deepcopy(fc.state_dict())
             best_proj = copy.deepcopy(proj.state_dict())
-            if paco is not None:
-                best_paco = copy.deepcopy(paco.state_dict())
         loginfo = 'Val Epoch:{} Loss: {:.4f} Acc: {:.4f}'.format(epoch, epoch_lossval, epoch_accval)
         log.append(loginfo + '\n')
         log.append('topacc: ' + str(topacc) + '\n')
@@ -343,10 +340,7 @@ def train_joint(args, classtype, device, trainset, valset, testset, model, fc, p
     model.load_state_dict(best_model)
     fc.load_state_dict(best_fc)
     proj.load_state_dict(best_proj)
-    if paco is not None:
-        paco.load_state_dict(best_paco)
     M.get_features_test(testset)   # best-val 回载后的最终测试（混淆矩阵/PerClassF1/macroF1 进日志）
-    return paco                    # paco 模式返回 PaCoLoss 模块供 checkpoint 保存（其余模式为 None）
 
 
 def train_twostage(args, classtype, device, trainset, valset, testset, model, fc, proj, log):
@@ -514,7 +508,7 @@ def main():
     parser.add_argument('--mode', type=str, default='joint', choices=['joint', 'twostage', 'pure', 'genscl', 'paco'],
                         help='joint=CE+w·SupCon 联合单循环；twostage=SupCon 预训练+CE 两阶段；'
                              'pure=纯 SupCon+kNN 评估；genscl=CE+w·GenSCL（Eq.2 复刻，骨架同 joint）；'
-                             'paco=CE+w·PaCo（类别中心+BS 中心重平衡，骨架同 joint）')
+                             'paco=官方口径 PaCo 单损失（中心=fc 权重+BS 内嵌，无独立 CE）')
     parser.add_argument('--knn_k', type=int, default=20, help='pure 模式 kNN 的邻居数 k')
     parser.add_argument('--num_epochs', type=int, default=25, help='joint/pure 模式总轮数')
     parser.add_argument('--stage1_epochs', type=int, default=25, help='twostage 阶段一（SupCon 预训练）轮数')
@@ -523,9 +517,10 @@ def main():
                         help='twostage 跳过 Stage1：加载已有 SupCon 预训练 checkpoint（传时间戳如 20261025093610，'
                              '需存在 model*/proj* 同戳两件套；须与当前 seed/数据划分一致')
     parser.add_argument('--temperature', type=float, default=0.07, help='SupCon 温度 τ')
-    parser.add_argument('--supcon_weight', type=float, default=0.5, help='joint/genscl/paco 模式对比项权重 w')
+    parser.add_argument('--supcon_weight', type=float, default=0.5,
+                        help='joint/genscl 模式对比项权重 w（paco 为单损失，此参数不生效仅回显）')
     parser.add_argument('--paco_alpha', type=float, default=0.05,
-                        help='paco 模式样本正对权重 α（论文默认 0.05；中心正对权重固定 1.0）')
+                        help='paco 模式样本正对权重 α（论文正文 0.05，官方脚本 default 1.0；β=γ=1 固定）')
     parser.add_argument('--lr_BB', type=float, default=1e-6)
     parser.add_argument('--lr_FC', type=float, default=1e-3)
     parser.add_argument('--stepsize_BB', type=int, default=6)
@@ -571,9 +566,8 @@ def main():
     print(starttime)
     startpoint = time.time()
 
-    paco_module = None
     if args.mode in ('joint', 'genscl', 'paco'):
-        paco_module = train_joint(args, classtype, device, trainset, valset, testset, model, fc, proj, log)
+        train_joint(args, classtype, device, trainset, valset, testset, model, fc, proj, log)
         tag = {'joint': 'supconjoint', 'genscl': 'supcongenscl', 'paco': 'supconpaco'}[args.mode]
     elif args.mode == 'twostage':
         train_twostage(args, classtype, device, trainset, valset, testset, model, fc, proj, log)
@@ -585,9 +579,8 @@ def main():
     endpoint = time.time()
     print('cost: ' + str(endpoint - startpoint) + 's.')
 
-    # ---- 存 checkpoint（pure 模式 fc 未训练不存；paco 模式加存中心件）+ 日志 ----
-    save_checkpoints(model, fc, proj, tag, args.datasetname, starttime,
-                     save_fc=(args.mode != 'pure'), centers=paco_module)
+    # ---- 存 checkpoint（pure 模式 fc 未训练不存；paco 中心=fc 权重，三件套已覆盖）+ 日志 ----
+    save_checkpoints(model, fc, proj, tag, args.datasetname, starttime, save_fc=(args.mode != 'pure'))
     paraminfo = args.modelname + '_' + args.datasetname + ' loss:supcon_' + args.mode \
                 + ' tau:' + str(args.temperature) + ' w:' + str(args.supcon_weight) \
                 + ' paco_alpha:' + str(args.paco_alpha) \
