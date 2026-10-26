@@ -36,3 +36,8 @@ python main.py --datasetname FI_8 --modelname ViT-B/16 --batch_size 32 --num_epo
 python supcon.py --mode pure --num_epochs 25 --knn_k 20 --seed 43 --datadir FI_seed43
 python supcon.py --mode joint --num_epochs 25 --seed 43 --datadir FI_seed43
 python supcon.py --mode twostage --stage1_ckpt 20261025093610 --stage2_epochs 10 --seed 43 --datadir FI_seed43
+
+
+------------------------------------------------------------------
+
+python supcon.py --mode paco --num_epochs 25 --paco_alpha 0.05 --seed 43 --datadir FI_seed43
