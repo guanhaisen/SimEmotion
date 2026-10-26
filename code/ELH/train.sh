@@ -1,0 +1,1 @@
+python train.py --dataset FI --path '' --network resnet50
