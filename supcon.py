@@ -1,11 +1,14 @@
 """supcon.py — 监督对比损失（SupCon, Khosla et al., NeurIPS 2020）实验脚本
 
-两种范式（--mode 选择）:
+四种范式（--mode 选择）:
   joint    (默认) : L = CE(fc(features)) + w·SupCon(proj(features))，单循环，
                     与 main.py 七档 loss 臂完全同构（同 warmup/双优化器/调度/best-val），消融对照最公平
   twostage        : 文献标准两阶段——Stage1 SupCon 预训练 backbone+投影头，Stage2 冻结特征用 CE 训分类头
   pure            : 纯 SupCon——全程无任何 CE 梯度，分类用 kNN（余弦相似度加权投票）评估，
                     最纯粹地度量对比损失对特征空间的塑造质量（文献标准的非参数评估）
+  genscl          : 广义监督对比损失（GenSCL, Kim et al. arXiv:2206.00384 Eq.2）忠实复刻，
+                    训练骨架与 joint 完全一致，仅把 SupCon 项换成"标签相似度 × 特征相似度交叉熵"
+                    （one-hot 标签下与 SupCon 的唯一数学差异：逐 anchor 归一化 1/|A(i)| vs 1/|P(i)|）
 
 与文献标准 SupCon 的已知偏离（写实验记录时必须注明）:
   - 不加数据增强：本项目所有臂的训练管线均无增强，SupCon 臂保持一致以保臂间公平
@@ -15,6 +18,7 @@
   python supcon.py --mode joint --num_epochs 25 --seed 43 --datadir FI_seed43
   python supcon.py --mode twostage --stage1_epochs 25 --stage2_epochs 10 --seed 43 --datadir FI_seed43
   python supcon.py --mode pure --num_epochs 25 --knn_k 20 --seed 43 --datadir FI_seed43
+  python supcon.py --mode genscl --num_epochs 25 --seed 43 --datadir FI_seed43
 
 说明:
   - 复用 main.py 的数据/模型/评估逻辑（import main as M 注入模式，同 test_saved_model.py）；
@@ -64,6 +68,34 @@ class SupConLoss(nn.Module):
         if not valid.any():
             return features.sum() * 0.0                               # 保梯度图的占位 0
         return -mean_log_prob_pos[valid].mean()
+
+
+class GenSCLLoss(nn.Module):
+    """广义监督对比损失（GenSCL, Kim et al. arXiv:2206.00384 Eq.2）忠实复刻：
+    L_gen = -1/|A(i)| Σ_{i∈I} Σ_{j∈A(i)} sim(y_i,y_j) · log( exp(z_i·z_j/τ) / Σ_{a∈A(i)} exp(z_i·z_a/τ) )
+    sim(y_i,y_j) = 标签向量的余弦相似度：one-hot 下退化为同类的 0/1 指示阵，
+    混合标签（CutMix/KD 软目标）下自动推广为 [0,1] 连续权重（本模式当前只用 one-hot）
+    与 SupConLoss 的两点数学差异（复刻对照臂的意义所在）:
+      1) 逐 anchor 归一化用 1/|A(i)|（B-1，全部对比样本）而非 1/|P(i)|（正样本数）
+      2) 无 valid 掩码——无同类正样本的 anchor 贡献 0 损失行，仍计入均值（与论文公式一致）
+    量级提示：one-hot 下 L_gen ≈ SupCon × |P(i)|/(B-1)（batch 32、每类约 4 正样本时约 0.1 倍），
+    同 w=0.5 时对比项的实际强度远小于 joint 臂——臂间对比时必须注明，或按量级折算 w
+    输入特征须已 L2 归一化；逐行减 max 保数值稳定；返回标量（batch 均值）"""
+    def __init__(self, temperature=0.07):
+        super().__init__()
+        self.tau = temperature
+
+    def forward(self, features, labels):
+        b = features.size(0)
+        y_onehot = F.one_hot(labels, num_classes=int(labels.max().item()) + 1).float()
+        sim_y = y_onehot @ y_onehot.t()                               # [B,B] 标签相似度 ∈ [0,1]，one-hot 范数恒为 1
+        logits = features @ features.t() / self.tau                   # [B,B] 余弦相似度/τ（特征已归一化）
+        logits = logits - logits.max(dim=1, keepdim=True).values.detach()
+        eye = torch.eye(b, dtype=torch.bool, device=features.device)
+        log_denom = torch.logsumexp(logits.masked_fill(eye, float('-inf')), dim=1, keepdim=True)  # log Σ_{a∈A(i)}
+        log_prob = (logits - log_denom).masked_fill(eye, 0.0)         # 对角置 0（j∈A(i) 不含自身）
+        per_anchor = -(sim_y * log_prob).sum(1) / max(b - 1, 1)       # 1/|A(i)| 归一化，|A(i)|=B-1
+        return per_anchor.mean()
 
 
 class SupConProjector(nn.Module):
@@ -165,9 +197,13 @@ def save_checkpoints(model, fc, proj, tag, datasetname, ts, save_fc=True):
 
 
 def train_joint(args, classtype, device, trainset, valset, testset, model, fc, proj, log):
-    """联合模式：L = CE + w·SupCon 单循环，骨架与 main.py get_features 一致"""
+    """联合模式：L = CE + w·SupCon 单循环，骨架与 main.py get_features 一致；
+    genscl 模式复用同一骨架，仅把对比项从 SupConLoss 换成 GenSCLLoss（Eq.2 复刻）"""
     criterion = nn.CrossEntropyLoss()
-    supcon_criterion = SupConLoss(temperature=args.temperature)
+    if args.mode == 'genscl':
+        supcon_criterion = GenSCLLoss(temperature=args.temperature)
+    else:
+        supcon_criterion = SupConLoss(temperature=args.temperature)
     optimizer = torch.optim.AdamW(model.visual.parameters(), lr=args.lr_BB, weight_decay=1e-5)
     optimizer_fc = torch.optim.Adam(fc.parameters(), lr=args.lr_FC)
     optimizer_proj = torch.optim.Adam(proj.parameters(), lr=args.lr_FC)
@@ -403,8 +439,9 @@ def main():
     parser.add_argument('--modelname', type=str, default='ViT-B/16', help='仅支持 ViT-B/16（fcdim=512）')
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--seed', type=int, default=43)
-    parser.add_argument('--mode', type=str, default='joint', choices=['joint', 'twostage', 'pure'],
-                        help='joint=CE+w·SupCon 联合单循环；twostage=SupCon 预训练+CE 两阶段；pure=纯 SupCon+kNN 评估')
+    parser.add_argument('--mode', type=str, default='joint', choices=['joint', 'twostage', 'pure', 'genscl'],
+                        help='joint=CE+w·SupCon 联合单循环；twostage=SupCon 预训练+CE 两阶段；'
+                             'pure=纯 SupCon+kNN 评估；genscl=CE+w·GenSCL（Eq.2 复刻，骨架同 joint）')
     parser.add_argument('--knn_k', type=int, default=20, help='pure 模式 kNN 的邻居数 k')
     parser.add_argument('--num_epochs', type=int, default=25, help='joint/pure 模式总轮数')
     parser.add_argument('--stage1_epochs', type=int, default=25, help='twostage 阶段一（SupCon 预训练）轮数')
@@ -458,9 +495,9 @@ def main():
     print(starttime)
     startpoint = time.time()
 
-    if args.mode == 'joint':
+    if args.mode in ('joint', 'genscl'):
         train_joint(args, classtype, device, trainset, valset, testset, model, fc, proj, log)
-        tag = 'supconjoint'
+        tag = 'supconjoint' if args.mode == 'joint' else 'supcongenscl'
     elif args.mode == 'twostage':
         train_twostage(args, classtype, device, trainset, valset, testset, model, fc, proj, log)
         tag = 'supcon2stage'
