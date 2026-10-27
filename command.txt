@@ -41,3 +41,5 @@ python supcon.py --mode twostage --stage1_ckpt 20261025093610 --stage2_epochs 10
 ------------------------------------------------------------------
 
 python supcon.py --mode paco --num_epochs 25 --paco_alpha 0.05 --seed 43 --datadir FI_seed43
+python supcon.py --mode genscl --num_epochs 25 --seed 43 --datadir FI_seed43
+python supcon.py --mode spread --num_epochs 25 --seed 43 --datadir FI_seed43
