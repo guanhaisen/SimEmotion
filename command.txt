@@ -43,3 +43,21 @@ python supcon.py --mode twostage --stage1_ckpt 20261025093610 --stage2_epochs 10
 python supcon.py --mode paco --num_epochs 25 --paco_alpha 0.05 --seed 43 --datadir FI_seed43
 python supcon.py --mode genscl --num_epochs 25 --seed 43 --datadir FI_seed43
 python supcon.py --mode spread --num_epochs 25 --seed 43 --datadir FI_seed43
+python supcon.py --mode pacoplus --num_epochs 25 --paco_alpha 0.05 --seed 43 --datadir FI_seed43
+
+
+
+------------------------------------------------------------------
+
+
+测试：
+
+python test_saved_model.py 20261026152557 --tag supconpaco  --datadir FI_seed43
+python test_saved_model.py 20261027152851 --tag supconspread --datadir FI_seed43
+
+python test_saved_model.py 20261029131417 --tag supconpure --datadir emotionroi_split
+
+
+python test_saved_model.py 20261026152557 --tag supconpaco --datasetname ArtPhoto --datadir artphoto_split
+
+python test_saved_model.py 20261016132806 --datadir FI_seed43

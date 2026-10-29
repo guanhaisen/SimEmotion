@@ -1,0 +1,4 @@
+python supcon.py --mode pure --datasetname EmotionROI --num_epochs 25 --knn_k 20 --seed 43 --datadir emotionroi_split/
+python supcon.py --mode paco --datasetname EmotionROI --num_epochs 25 --paco_alpha 0.05 --seed 43 --datadir emotionroi_split/
+python supcon.py --mode genscl --datasetname EmotionROI --num_epochs 25 --seed 43 --datadir emotionroi_split/
+python supcon.py --mode spread --datasetname EmotionROI --num_epochs 25 --seed 43 --datadir emotionroi_split/

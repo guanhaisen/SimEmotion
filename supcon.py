@@ -19,6 +19,11 @@
                     均以官方代码为准（论文 Eq.2-3 与官方代码有三处不一致，见 SpreadLoss docstring）。
                     按论文要求对训练集加标准对比增强（Lemma 3：去掉增强 cNCE 无意义），
                     本项目唯一带数据增强的臂；每步双前向（原图 + 增强图），耗时约 joint 的 1.8 倍
+  pacoplus        : 项目本土化混合：L = CE + w·官方 PaCo（BS 保留，paco_alpha 照常生效）——
+                    官方所有训练脚本均为 PaCoLoss 单独使用（PaCo/LT、paco_cifar、paco_imagenet 均无 +CE 组合），
+                    本臂测"官方单损失里加回显式 CE"的增益；注意分类器吃双信号
+                    （plain CE + w×BS-CE 中心项，CE 双计属设计而非 bug），与 paco 单损失直接对照；
+                    训练骨架与 joint 一致（warmup/双优化器/best-val/每轮 test）
 
 与文献标准 SupCon 的已知偏离（写实验记录时必须注明）:
   - 不加数据增强：本项目所有臂的训练管线均无增强，SupCon 臂保持一致以保臂间公平
@@ -351,7 +356,7 @@ def train_joint(args, classtype, device, trainset, valset, testset, model, fc, p
     spread_criterion = None
     if args.mode == 'genscl':
         supcon_criterion = GenSCLLoss(temperature=args.temperature)
-    elif args.mode == 'paco':
+    elif args.mode in ('paco', 'pacoplus'):
         # 类频率 q(y) = n_c/N（与 main.py wce 哨兵臂同口径），Balanced Softmax 内嵌于中心=fc 项
         counts = [sum(1 for _, l in trainset.images if l == c) for c in classtype]
         q = torch.tensor([n / max(sum(counts), 1) for n in counts], dtype=torch.float32)
@@ -399,6 +404,10 @@ def train_joint(args, classtype, device, trainset, valset, testset, model, fc, p
                 if args.mode == 'paco':
                     # 官方口径 PaCo 单损失：中心=fc 权重、BS 内嵌，无独立 CE、无 w
                     loss = supcon_criterion(proj(features), labels, outputs)
+                elif args.mode == 'pacoplus':
+                    # 项目本土化混合：显式 CE + w·官方 PaCo（BS 保留）——分类器双信号（CE 双计属设计）
+                    loss = criterion(outputs, labels) \
+                        + args.supcon_weight * supcon_criterion(proj(features), labels, outputs)
                 elif args.mode == 'spread':
                     # THANOS L_spread 官方口径：增强图进对比项（L_sup 自身对 + cNCE 正例），CE 头只看原图
                     features_aug = model.encode_image(images_aug).float()
@@ -615,11 +624,12 @@ def main():
     parser.add_argument('--modelname', type=str, default='ViT-B/16', help='仅支持 ViT-B/16（fcdim=512）')
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--seed', type=int, default=43)
-    parser.add_argument('--mode', type=str, default='joint', choices=['joint', 'twostage', 'pure', 'genscl', 'paco', 'spread'],
+    parser.add_argument('--mode', type=str, default='joint', choices=['joint', 'twostage', 'pure', 'genscl', 'paco', 'spread', 'pacoplus'],
                         help='joint=CE+w·SupCon 联合单循环；twostage=SupCon 预训练+CE 两阶段；'
                              'pure=纯 SupCon+kNN 评估；genscl=CE+w·GenSCL（Eq.2 复刻，骨架同 joint）；'
                              'paco=官方口径 PaCo 单损失（中心=fc 权重+BS 内嵌，无独立 CE）；'
-                             'spread=THANOS L_spread（CE+w·[(1-α)SupCon+α·cNCE]，唯一带增强的臂）')
+                             'spread=THANOS L_spread（CE+w·[(1-α)SupCon+α·cNCE]，唯一带增强的臂）；'
+                             'pacoplus=CE+w·官方 PaCo（BS 保留，项目本土化混合，官方无此组合）')
     parser.add_argument('--knn_k', type=int, default=20, help='pure 模式 kNN 的邻居数 k')
     parser.add_argument('--num_epochs', type=int, default=25, help='joint/pure 模式总轮数')
     parser.add_argument('--stage1_epochs', type=int, default=25, help='twostage 阶段一（SupCon 预训练）轮数')
@@ -629,9 +639,9 @@ def main():
                              '需存在 model*/proj* 同戳两件套；须与当前 seed/数据划分一致')
     parser.add_argument('--temperature', type=float, default=0.07, help='SupCon 温度 τ')
     parser.add_argument('--supcon_weight', type=float, default=0.5,
-                        help='joint/genscl 模式对比项权重 w（paco 为单损失，此参数不生效仅回显）')
+                        help='joint/genscl/spread/pacoplus 模式对比项权重 w（paco 为单损失，此参数不生效仅回显）')
     parser.add_argument('--paco_alpha', type=float, default=0.05,
-                        help='paco 模式样本正对权重 α（论文正文 0.05，官方脚本 default 1.0；β=γ=1 固定）')
+                        help='paco/pacoplus 模式样本正对权重 α（论文正文 0.05，官方脚本 default 1.0；β=γ=1 固定）')
     parser.add_argument('--spread_alpha', type=float, default=0.5,
                         help='spread 模式 cNCE 权重 α：L=(1-α)·L_sup+α·cNCE（官方实验配置 a_lc=a_spread=1 → α=0.5；'
                              '论文理论 spread 区 α>2/3 与官方配置不一致，按官方代码为准；α=0 退化为纯 L_in 版 SupCon）')
@@ -680,10 +690,10 @@ def main():
     print(starttime)
     startpoint = time.time()
 
-    if args.mode in ('joint', 'genscl', 'paco', 'spread'):
+    if args.mode in ('joint', 'genscl', 'paco', 'spread', 'pacoplus'):
         train_joint(args, classtype, device, trainset, valset, testset, model, fc, proj, log)
         tag = {'joint': 'supconjoint', 'genscl': 'supcongenscl', 'paco': 'supconpaco',
-               'spread': 'supconspread'}[args.mode]
+               'spread': 'supconspread', 'pacoplus': 'supconpacoplus'}[args.mode]
     elif args.mode == 'twostage':
         train_twostage(args, classtype, device, trainset, valset, testset, model, fc, proj, log)
         tag = 'supcon2stage'
