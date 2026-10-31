@@ -119,39 +119,46 @@ def get_features(traindataset, valdataset):
         if epoch >= args.warmepoch:
             scheduler.step()
         scheduler_fc.step()
-        running_lossval = 0.0
-        running_correctsval = 0
+        if valdataset is not None:
+            running_lossval = 0.0
+            running_correctsval = 0
 
-        for images, labels in tqdm(DataLoader(valdataset, batch_size=args.batch_size, shuffle=False)):
-            images = images.to(device)
-            labels = labels.to(device)
-            with torch.set_grad_enabled(False):
-                features = model.encode_image(images).float()
-                outputs = fc(features)
-                loss = criterion(outputs, labels)
-                _, preds = torch.max(outputs, 1)
-            running_lossval += loss.item() * features.size(0)
-            running_correctsval += torch.sum(preds == labels.data)
-        epoch_lossval = running_lossval / len(valdataset)
-        epoch_accval = running_correctsval.double() / len(valdataset)
-        if epoch_accval > topacc:
-            topacc = epoch_accval
-            best_model = copy.deepcopy(model.state_dict())
-            best_fc = copy.deepcopy(fc.state_dict())
+            for images, labels in tqdm(DataLoader(valdataset, batch_size=args.batch_size, shuffle=False)):
+                images = images.to(device)
+                labels = labels.to(device)
+                with torch.set_grad_enabled(False):
+                    features = model.encode_image(images).float()
+                    outputs = fc(features)
+                    loss = criterion(outputs, labels)
+                    _, preds = torch.max(outputs, 1)
+                running_lossval += loss.item() * features.size(0)
+                running_correctsval += torch.sum(preds == labels.data)
+            epoch_lossval = running_lossval / len(valdataset)
+            epoch_accval = running_correctsval.double() / len(valdataset)
+            if epoch_accval > topacc:
+                topacc = epoch_accval
+                best_model = copy.deepcopy(model.state_dict())
+                best_fc = copy.deepcopy(fc.state_dict())
 
-        loginfo = 'Val Epoch:{} Loss: {:.4f} Acc: {:.4f}'.format(epoch, epoch_lossval, epoch_accval)
-        log.append(loginfo + '\n')
-        topaccinfo = 'topacc: ' + str(topacc) + '\n'
-        log.append(topaccinfo)
-        print(loginfo)
-        print(topaccinfo)
-        # 每轮用当前模型在测试集上评估一次（仅记录曲线，模型选择仍以 val 为准）
+            loginfo = 'Val Epoch:{} Loss: {:.4f} Acc: {:.4f}'.format(epoch, epoch_lossval, epoch_accval)
+            log.append(loginfo + '\n')
+            topaccinfo = 'topacc: ' + str(topacc) + '\n'
+            log.append(topaccinfo)
+            print(loginfo)
+            print(topaccinfo)
+        else:
+            # --no_val 固定轮数协议：无验证集、无 best-val 选择，最后一轮权重即最终模型
+            novalinfo = 'Val skipped (--no_val): epoch {} done, last-epoch weights kept'.format(epoch)
+            log.append(novalinfo + '\n')
+            print(novalinfo)
+        # 每轮用当前模型在测试集上评估一次（仅记录曲线；有 val 时模型选择以 val 为准，--no_val 时直接用最后一轮）
         testacc = get_features_test(testset)
         epoctestinfo = 'Test@Epoch:{} Acc: {:.4f}'.format(epoch, testacc)
         log.append(epoctestinfo + '\n')
         print(epoctestinfo)
-    model.load_state_dict(best_model)
-    fc.load_state_dict(best_fc)
+    if valdataset is not None:
+        model.load_state_dict(best_model)
+        fc.load_state_dict(best_fc)
     torch.save(model.state_dict(), './savemodel/model' + args.modelname + '_' + args.datasetname + '_' + str(starttime) + '.pth')
     torch.save(fc.state_dict(), './savemodel/fc' + args.modelname + '_' + args.datasetname + '_' + str(starttime) + '.pth')
     get_features_test(testset)
@@ -356,6 +363,9 @@ if __name__ == '__main__':
     parser.add_argument('--gamma_FC', type=float, default=0.5)
     parser.add_argument('--warmepoch', type=int, default=3)
     parser.add_argument('--datadir', type=str, default=None, help='覆盖 FI_8 数据目录（如 FI_seed43），结尾斜杠可省略')
+    parser.add_argument('--no_val', action='store_true',
+                        help='小数据集 k 折协议：不加载 val、不做 best-val 选择，训满 num_epochs 用最后一轮权重做 FinalTest'
+                             '（要求 datadir 下无 val/ 也不报错；逐轮 Test 日志仍记录，仅供画曲线，不用于选模型）')
     parser.add_argument('--loss', type=str, default='ce', choices=['ce', 'fal', 'listmle', 'fal_listmle', 'ce_fal_mle', 'dist_fal', 'wce'], help='监督损失：ce=交叉熵，fal=fuzzy-aware loss（FAL），listmle=CE+λ·ListMLE情绪序约束，fal_listmle=FAL+λ·p_ŷ·ListMLE组合，ce_fal_mle=CE+模糊项+ListMLE无调制三合一，dist_fal=方案B距离软标签FAL（τ=1.0），wce=类频率倒数加权CE（PaCo哨兵臂）')
     args = parser.parse_args()
     if args.datadir and not args.datadir.endswith('/'):
@@ -374,7 +384,7 @@ if __name__ == '__main__':
 
     # load the dataset
     trainset = Loaddata('train')
-    valset = Loaddata('val')
+    valset = None if args.no_val else Loaddata('val')   # --no_val：小数据集 k 折协议，不加载 val
     testset = Loaddata('test')
 
     # load the training setting
@@ -416,7 +426,9 @@ if __name__ == '__main__':
     # log saving
     paraminfo = args.modelname + '_' +args.datasetname + ' loss:' + args.loss + ' lr_FC:' + str(args.lr_FC) + ' stepsize_FC:' \
                 + str(args.stepsize_FC) + ' gamma_FC' + str(args.gamma_FC) + ' lr_BB:' + str(args.lr_BB) \
-                + ' stepsize_BB:' + str(args.stepsize_BB) + ' gamma_BB' + str(args.gamma_BB)
+                + ' stepsize_BB:' + str(args.stepsize_BB) + ' gamma_BB' + str(args.gamma_BB) \
+                + ' seed:' + str(args.seed) + (' no_val:True' if args.no_val else '') \
+                + (' datadir:' + args.datadir if args.datadir else '')
     print(paraminfo)
     log.append(paraminfo + '\n')
     with open('./log/' + args.modelname + '_' + args.datasetname + str(acc) + '_' + str(starttime) + '.txt', 'a+') as flog:

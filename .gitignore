@@ -36,3 +36,4 @@ cate info/
 # ===== 系统 =====
 .DS_Store
 Thumbs.db
+*.jpg
