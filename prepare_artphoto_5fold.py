@@ -26,7 +26,8 @@ SPLITS = ['train', 'test']
 
 
 def load_manifest_counts():
-    """从 split_manifest.txt 统计每折每类文件数（sad 计入 sadness）"""
+    """从 split_manifest.txt 统计每折每类文件数（sad 计入 sadness）
+    manifest 行格式：fold<TAB>split<TAB>文件名 空格 标签（类别从文件名前缀取，如 amusement_0487.jpg / sad_0123.jpg）"""
     counts = defaultdict(int)
     path = os.path.join(FOLD_ROOT, 'split_manifest.txt')
     if not os.path.exists(path):
@@ -36,11 +37,11 @@ def load_manifest_counts():
             line = line.strip()
             if not line or line.startswith('#'):
                 continue
-            parts = line.split('\t')
-            if len(parts) != 3:
+            parts = line.split()
+            if len(parts) < 3:
                 continue
-            fold, split, rel = parts
-            cls = os.path.dirname(rel)          # 如 'amusement' 或 'sad'
+            fold, split, filename = parts[0], parts[1], parts[2]
+            cls = filename.split('_')[0]        # 类别 = 文件名前缀
             cls = 'sadness' if cls == 'sad' else cls
             counts[(fold, split, cls)] += 1
     return counts

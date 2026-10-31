@@ -37,3 +37,5 @@ cate info/
 .DS_Store
 Thumbs.db
 *.jpg
+*.csv
+*.rtf
