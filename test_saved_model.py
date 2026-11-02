@@ -15,6 +15,9 @@
   # 跨数据集（如 FI 模型测 ArtPhoto——图像源不同，无泄漏问题）：
   python test_saved_model.py 20261016132806 --datadir artphoto_split
 
+  # WiSE-FT 臂（main.py --wise_init 训练的单层线性头 + 特征 L2 归一化）：
+  python test_saved_model.py <ts> --datadir FI_seed43 --wise_init
+
 说明:
 - 复用 main.py 的数据/模型定义（Loaddata / FCN / get_features_test / f1_from_matrix），
   保证与训练时的测试逻辑完全一致；
@@ -101,6 +104,8 @@ def main():
                         help='supcon.py 系标记（supconjoint/supconpure/supcongenscl/supconpaco/'
                              'supconspread/supconpacoplus/supcon2stage）；缺省走 main.py 系权重')
     parser.add_argument('--knn_k', type=int, default=20, help='pure 两件套的 kNN 邻居数')
+    parser.add_argument('--wise_init', action='store_true',
+                        help='WiSE-FT 臂（main.py --wise_init 训练）：单层线性头 + 图像特征 L2 归一化，须与训练时一致')
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -111,7 +116,8 @@ def main():
     # args 必须先于 datasetInit 设置（datasetInit 内部读取 args.datadir）
     if args.datadir and not args.datadir.endswith('/'):
         args.datadir += '/'   # 与 main.py 相同：路径按字符串拼接，结尾斜杠必须补齐
-    M.args = types.SimpleNamespace(datasetname=args.datasetname, batch_size=32, datadir=args.datadir)
+    M.args = types.SimpleNamespace(datasetname=args.datasetname, batch_size=32, datadir=args.datadir,
+                                   wise_init=args.wise_init)
     classtype, data_dir = M.datasetInit(args.datasetname)
     M.classtype = classtype
     M.data_dir = data_dir
@@ -131,8 +137,9 @@ def main():
         print("fc 权重   :", fpath)
         model.load_state_dict(torch.load(mpath, map_location="cpu"))
         model = model.to(device).eval()
-        fc = M.FCN(dim=512).to(device)
-        fc.load_state_dict(torch.load(fpath, map_location="cpu"))
+        fc_sd = torch.load(fpath, map_location="cpu")
+        fc = M.FCN(dim=512, linear_head=('classifier.weight' in fc_sd)).to(device)  # WiSE-FT 单层线性头自动识别
+        fc.load_state_dict(fc_sd)
         fc.eval()
         M.model, M.fc = model, fc
         testset = M.Loaddata("test")
@@ -148,8 +155,9 @@ def main():
         M.model = model
         if fpath is not None:
             print("fc 权重   :", fpath, "（三件套，标准 fc 评估路径；proj 不参与评估）")
-            fc = M.FCN(dim=512).to(device)
-            fc.load_state_dict(torch.load(fpath, map_location="cpu"))
+            fc_sd = torch.load(fpath, map_location="cpu")
+            fc = M.FCN(dim=512, linear_head=('classifier.weight' in fc_sd)).to(device)
+            fc.load_state_dict(fc_sd)
             fc.eval()
             M.fc = fc
             testset = M.Loaddata("test")

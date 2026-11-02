@@ -9,6 +9,7 @@ from tqdm import tqdm
 import torch.nn as nn
 import torch.optim as optim
 from torch.optim import lr_scheduler
+from torchvision.transforms import Compose, RandomResizedCrop, ToTensor, Normalize
 from torch.utils.data import DataLoader
 import time
 import copy
@@ -61,6 +62,7 @@ def convert_models_to_fp32(model):
 class Loaddata(torch.utils.data.Dataset):
     def __init__(self, setname):
         self.images = []
+        self.setname = setname
         path = data_dir
         self.classindex = {c: i for i, c in enumerate(classtype)}   # 动态适配各数据集的类别表
 
@@ -74,7 +76,14 @@ class Loaddata(torch.utils.data.Dataset):
 
     def __getitem__(self, item):
         image, label = self.images[item]
-        img = preprocess(Image.open(image)).to(device)
+        # --aug 时仅训练集走论文增强管线，val/test 仍用确定性 eval preprocess；
+        # globals().get 兼容 test_saved_model.py 注入命名空间（该脚本只取 test 集）
+        tfm = preprocess
+        if self.setname == 'train' and getattr(args, 'aug', False):
+            tp = globals().get('train_preprocess')
+            if tp is not None:
+                tfm = tp
+        img = tfm(Image.open(image)).to(device)
         labelindex = self.classindex[label]
         return img, labelindex
 
@@ -97,7 +106,7 @@ def get_features(traindataset, valdataset):
                 optimizer.zero_grad()
             optimizer_fc.zero_grad()
             with torch.set_grad_enabled(True):
-                features = model.encode_image(images).float()
+                features = encode_features(images)
                 outputs = fc(features)
                 loss = criterion(outputs, labels)
                 _, preds = torch.max(outputs, 1)
@@ -127,7 +136,7 @@ def get_features(traindataset, valdataset):
                 images = images.to(device)
                 labels = labels.to(device)
                 with torch.set_grad_enabled(False):
-                    features = model.encode_image(images).float()
+                    features = encode_features(images)
                     outputs = fc(features)
                     loss = criterion(outputs, labels)
                     _, preds = torch.max(outputs, 1)
@@ -187,7 +196,7 @@ def get_features_test(dataset, prefix='Test'):
             images = images.to(device)
             labels = labels.to(device)
             with torch.set_grad_enabled(False):
-                features = model.encode_image(images).float()
+                features = encode_features(images)
                 outputs = fc(features)
                 loss = criterion(outputs, labels)
                 _, preds = torch.max(outputs, 1)
@@ -212,19 +221,76 @@ def get_features_test(dataset, prefix='Test'):
 
 class FCN(nn.Module):
 
-    def __init__(self, dim=512):
+    def __init__(self, dim=512, linear_head=False):
         super(FCN, self).__init__()
-        self.classifier = nn.Sequential(
-            nn.Linear(dim, 2048),
-            nn.ReLU(inplace=True),
-            nn.Linear(2048, len(classtype)),
-        )
+        if linear_head:
+            # WiSE-FT --wise_init 用：单层线性头（论文的零样本分类器本就是线性的）
+            self.classifier = nn.Linear(dim, len(classtype))
+        else:
+            self.classifier = nn.Sequential(
+                nn.Linear(dim, 2048),
+                nn.ReLU(inplace=True),
+                nn.Linear(2048, len(classtype)),
+            )
 
     def forward(self, x):
         x = torch.flatten(x, 1)
         x = self.classifier(x)
 
         return x
+
+
+# WiSE-FT --wise_init 的零样本 prompt 模板（每类对全部模板取平均嵌入；可按需增删）
+ZS_TEMPLATES = [
+    'a photo of {}.',
+    'a blurry photo of {}.',
+    'a low resolution photo of {}.',
+    'a cropped photo of {}.',
+    'a bright photo of {}.',
+    'a dark photo of {}.',
+    'a photo of a person expressing {}.',
+    'a photo of a scene evoking {}.',
+]
+
+
+def build_zero_shot_head(model, device, fcdim):
+    """WiSE-FT（Wortsman et al. 2022）附录 D.2 配方：用零样本分类器初始化最终分类层。
+    每类对 ZS_TEMPLATES 做文本嵌入平均 → L2 归一化 → 乘预训练温度参数（logit_scale≈100），
+    微调期间不再含温度参数（偏置清零）。头为单层线性（linear_head=True）——论文的零样本
+    分类器本就是线性的，与 MLP 臂存在架构差异，归因时注意。配套：encode_features 会在
+    --wise_init 时对图像特征 L2 归一化（论文要求零样本分类器接收归一化的编码器输出）。"""
+    with torch.no_grad():
+        rows = []
+        for c in classtype:
+            toks = clip.tokenize([t.format(c) for t in ZS_TEMPLATES]).to(device)
+            e = model.encode_text(toks).float()                     # [T, d]，fp16 模型输出转 fp32
+            e = e / e.norm(dim=-1, keepdim=True)
+            rows.append(e.mean(dim=0))
+        W = torch.stack(rows)                                       # [K, d]
+        W = W / W.norm(dim=-1, keepdim=True)
+        W = model.logit_scale.exp().float() * W                     # ×温度参数
+        head = FCN(dim=fcdim, linear_head=True).to(device)
+        head.classifier.weight.data.copy_(W)
+        head.classifier.bias.data.zero_()
+    return head
+
+
+def encode_features(images):
+    """统一的特征编码入口：--wise_init 时对编码器输出做 L2 归一化（论文 D.2 要求），
+    其余臂与原行为逐字节一致。getattr 保证 test_saved_model.py 注入的精简 args 不报错"""
+    feats = model.encode_image(images).float()
+    if getattr(args, 'wise_init', False):
+        feats = F.normalize(feats, dim=-1)
+    return feats
+
+
+def _to_rgb(image):
+    return image.convert('RGB')
+
+
+# 说明：--aug 训练增强为 wise-ft 官方实现（其修改版 clip/clip.py 的 _transform(is_train=True)）：
+# RandomResizedCrop(n_px, scale=(0.9, 1.0), interpolation=BICUBIC) + 转 RGB + ToTensor + CLIP Normalize。
+# 无翻转、无颜色抖动，与论文附录 D.2 "randomly cropping a square from resized images" 一致。
 
 
 class FuzzyAwareLoss(nn.Module):
@@ -359,6 +425,14 @@ if __name__ == '__main__':
     parser.add_argument('--stepsize_BB', type=int, default=6)
     parser.add_argument('--gamma_BB', type=float, default=0.5)
     parser.add_argument('--lr_FC', type=float, default=1e-3)
+    parser.add_argument('--wd_FC', type=float, default=0.0,
+                        help='FC 头 weight decay；>0 时头优化器切换为 AdamW（WiSE-FT 论文配方），=0 保持 Adam 不变')
+    parser.add_argument('--wise_init', action='store_true',
+                        help='WiSE-FT 论文配方（附录 D.2）：用零样本文本嵌入×温度初始化单层线性 FC 头，'
+                             '并在训练/评估全程 L2 归一化图像特征；测试脚本需加 --wise_init')
+    parser.add_argument('--aug', action='store_true',
+                        help='WiSE-FT 论文训练增强（官方实现：RandomResizedCrop scale=0.9-1.0 BICUBIC）；'
+                             '仅作用于训练集，val/test 仍为确定性 eval preprocess；默认关闭')
     parser.add_argument('--stepsize_FC', type=int, default=6)
     parser.add_argument('--gamma_FC', type=float, default=0.5)
     parser.add_argument('--warmepoch', type=int, default=3)
@@ -379,8 +453,23 @@ if __name__ == '__main__':
     model, preprocess = clip.load(args.modelname, device)
     clip.model.convert_weights(model)
     fcdim = 512
-    fc = FCN(dim=fcdim).to(device)
+    if args.wise_init:
+        fc = build_zero_shot_head(model, device, fcdim)   # WiSE-FT：零样本分类器初始化单层线性头
+    else:
+        fc = FCN(dim=fcdim).to(device)
     args.modelname = args.modelname.replace('/', '-')
+
+    # --aug 训练增强管线（wise-ft 官方实现：RandomResizedCrop，见上方说明块）
+    train_preprocess = None
+    if args.aug:
+        n_px = model.visual.input_resolution                     # ViT-B/16 = 224
+        train_preprocess = Compose([
+            RandomResizedCrop(n_px, scale=(0.9, 1.0), interpolation=Image.BICUBIC),
+            _to_rgb,
+            ToTensor(),
+            Normalize((0.48145466, 0.4578275, 0.40821073),       # CLIP 官方均值/方差，同 eval preprocess
+                      (0.26862954, 0.26130258, 0.27577711)),
+        ])
 
     # load the dataset
     trainset = Loaddata('train')
@@ -408,7 +497,10 @@ if __name__ == '__main__':
     else:
         criterion = nn.CrossEntropyLoss()
     optimizer = optim.AdamW(model.visual.parameters(), lr=args.lr_BB, weight_decay=args.wd_BB)
-    optimizer_fc = optim.Adam(fc.parameters(), lr=args.lr_FC)
+    if args.wd_FC > 0:
+        optimizer_fc = optim.AdamW(fc.parameters(), lr=args.lr_FC, weight_decay=args.wd_FC)  # WiSE-FT 配方
+    else:
+        optimizer_fc = optim.Adam(fc.parameters(), lr=args.lr_FC)
     scheduler = lr_scheduler.StepLR(optimizer, step_size=args.stepsize_BB, gamma=args.gamma_BB)
     scheduler_fc = lr_scheduler.StepLR(optimizer_fc, step_size=args.stepsize_FC, gamma=args.gamma_FC)
 
@@ -427,7 +519,10 @@ if __name__ == '__main__':
     paraminfo = args.modelname + '_' +args.datasetname + ' loss:' + args.loss + ' lr_FC:' + str(args.lr_FC) + ' stepsize_FC:' \
                 + str(args.stepsize_FC) + ' gamma_FC' + str(args.gamma_FC) + ' lr_BB:' + str(args.lr_BB) \
                 + ' stepsize_BB:' + str(args.stepsize_BB) + ' gamma_BB' + str(args.gamma_BB) \
-                + ' seed:' + str(args.seed) + (' no_val:True' if args.no_val else '') \
+                + ' seed:' + str(args.seed) + ' wd_FC:' + str(args.wd_FC) \
+                + (' wise_init:True' if args.wise_init else '') \
+                + (' aug:True' if args.aug else '') \
+                + (' no_val:True' if args.no_val else '') \
                 + (' datadir:' + args.datadir if args.datadir else '')
     print(paraminfo)
     log.append(paraminfo + '\n')
