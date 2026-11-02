@@ -24,10 +24,20 @@
                     本臂测"官方单损失里加回显式 CE"的增益；注意分类器吃双信号
                     （plain CE + w×BS-CE 中心项，CE 双计属设计而非 bug），与 paco 单损失直接对照；
                     训练骨架与 joint 一致（warmup/双优化器/best-val/每轮 test）
+  mergemix        : MergeMix（Jin et al., ICLR 2026）论文原版分类损失（Eq.9）：
+                    L = λ̂·CE(fc(f(x̂)),y_i) + (1−λ̂)·CE(fc(f(x̂)),y_j) + CE(fc(f(x)),y)
+                    其中混合图 x̂ 由 ToMe 合并后恢复的 CLS 注意力掩码生成（tome_clip.py 移植——
+                    官方 ToMe 库无 CLIP 补丁，BSM 核心算法逐行移植自 facebookresearch/ToMe）；
+                    λ̂ 为高斯重缩放混合比例（Eq.8：μ=K/L, σ=ΣM/L, τ=1e-5）；
+                    r=0 时退化为 TopK 消融版（论文 Table 7 第二行）；评估时 r 强制为 0
+                    （与其他臂同分布可比）；本项目唯一 mixup 类增强臂；
+                    每步双前向（原图抓注意力 + 混合图算损失），耗时约 joint 的 1.8 倍；
+                    对比项/投影头不参与本臂损失（论文纯分类口径，proj 仅随三件套保存）
 
 与文献标准 SupCon 的已知偏离（写实验记录时必须注明）:
   - 不加数据增强：本项目所有臂的训练管线均无增强，SupCon 臂保持一致以保臂间公平
-    （唯一例外：spread 臂的 cNCE 正例就是增强视图，必须加增强才能忠实复刻论文）
+    （两个例外：spread 臂的 cNCE 正例就是增强视图，必须加增强才能忠实复刻论文；
+    mergemix 臂按论文口径使用 ToMe 掩码 mixup 增强，属方法本体而非管线偏离）
   - "正样本" = batch 内同标签样本（非同图两视角）
 
 用法（SimEmotion 目录、venv 激活下）:
@@ -37,6 +47,7 @@
   python supcon.py --mode genscl --num_epochs 25 --seed 43 --datadir FI_seed43
   python supcon.py --mode paco --num_epochs 25 --paco_alpha 0.05 --seed 43 --datadir FI_seed43
   python supcon.py --mode spread --num_epochs 25 --spread_alpha 0.7 --seed 43 --datadir FI_seed43
+  python supcon.py --mode mergemix --num_epochs 25 --mm_r 8 --seed 43 --datadir FI_seed43
 
 说明:
   - 复用 main.py 的数据/模型/评估逻辑（import main as M 注入模式，同 test_saved_model.py）；
@@ -350,7 +361,12 @@ def train_joint(args, classtype, device, trainset, valset, testset, model, fc, p
     paco 模式为官方口径单损失：L = PaCo(proj(features), labels, fc(features))，无独立 CE、无 w
     （中心=fc 权重、BS 内嵌；PaCoLoss 无可学习参数，fc 仍由 optimizer_fc 按原口径优化）；
     spread 模式（THANOS L_spread 官方口径）：L = CE + w·[(1-α)·L_sup + α·cNCE]，训练集经 AugPairDataset
-    包装双视图加载，增强图进对比项（L_sup 自身对 + cNCE 正例），CE 头只看原图，评估管线与其他臂完全一致"""
+    包装双视图加载，增强图进对比项（L_sup 自身对 + cNCE 正例），CE 头只看原图，评估管线与其他臂完全一致；
+    mergemix 模式（MergeMix 论文 Eq.9 纯分类损失）：ToMe 掩码 mixup + λ̂ 高斯重缩放，
+    L = λ̂·CE(fc(f(x̂)),y_i) + (1−λ̂)·CE(fc(f(x̂)),y_j) + CE(fc(f(x)),y)，
+    掩码由干净图前向顺带快照的最后一层 CLS 注意力恢复生成（零额外前向），
+    混合图走第二次前向（~1.8× 开销同 spread）；对比项/投影头不参与损失；
+    训练时 visual.r=args.mm_r，评估（run_val/get_features_test）强制 r=0"""
     criterion = nn.CrossEntropyLoss()
     paco = None
     spread_criterion = None
@@ -366,6 +382,8 @@ def train_joint(args, classtype, device, trainset, valset, testset, model, fc, p
     elif args.mode == 'spread':
         spread_criterion = SpreadLoss(temperature=args.temperature, alpha=args.spread_alpha).to(device)
         supcon_criterion = None
+    elif args.mode == 'mergemix':
+        supcon_criterion = None   # 论文纯分类口径：无对比项，proj 不参与损失
     else:
         supcon_criterion = SupConLoss(temperature=args.temperature)
     optimizer = torch.optim.AdamW(model.visual.parameters(), lr=args.lr_BB, weight_decay=1e-5)
@@ -394,6 +412,8 @@ def train_joint(args, classtype, device, trainset, valset, testset, model, fc, p
                 images, labels = batch
             images = images.to(device)
             labels = labels.to(device)
+            if args.mode == 'mergemix':
+                model.visual.r = args.mm_r   # 训练时开 ToMe 合并（评估前关闭）
             if epoch >= args.warmepoch:
                 optimizer.zero_grad()
             optimizer_fc.zero_grad()
@@ -401,7 +421,24 @@ def train_joint(args, classtype, device, trainset, valset, testset, model, fc, p
             with torch.set_grad_enabled(True):
                 features = model.encode_image(images).float()
                 outputs = fc(features)
-                if args.mode == 'paco':
+                if args.mode == 'mergemix':
+                    # ---- MergeMix 论文 Eq.9：ToMe 掩码 mixup + λ̂ 重缩放（纯分类损失）----
+                    # 干净图前向已顺带快照最后一层 CLS 注意力与 source map（零额外前向）
+                    info = model.visual._tome_info
+                    attn_L = tome_clip.recover_cls_attention(info)          # (B, 1+196) Eq.6
+                    L_seq = attn_L.shape[1]
+                    k_final = info["source"].shape[-1] if info["source"] is not None else L_seq
+                    lam = torch.distributions.Beta(args.mm_alpha, args.mm_alpha)\
+                        .sample((images.size(0),)).to(images.device)
+                    mixed, perm, mask_tok = tome_clip.build_mix(images, attn_L, lam)  # Eq.2/7
+                    feat_mix = model.encode_image(mixed).float()   # 混合图第二次前向
+                    out_mix = fc(feat_mix)
+                    lam_hat = tome_clip.rescale_lambda(k_final, L_seq, mask_tok)       # Eq.8
+                    # Eq.9：λ̂ 加权混合 CE（逐样本 reduction='none'）+ 干净图标准 CE
+                    ce_mix = F.cross_entropy(out_mix, labels, reduction='none') * lam_hat \
+                        + F.cross_entropy(out_mix, labels[perm], reduction='none') * (1.0 - lam_hat)
+                    loss = ce_mix.mean() + criterion(outputs, labels)
+                elif args.mode == 'paco':
                     # 官方口径 PaCo 单损失：中心=fc 权重、BS 内嵌，无独立 CE、无 w
                     loss = supcon_criterion(proj(features), labels, outputs)
                 elif args.mode == 'pacoplus':
@@ -427,6 +464,9 @@ def train_joint(args, classtype, device, trainset, valset, testset, model, fc, p
                 optimizer_proj.step()
             running_loss += loss.item() * features.size(0)
             running_corrects += torch.sum(preds == labels.data)
+
+        if args.mode == 'mergemix':
+            model.visual.r = 0   # 评估（run_val / get_features_test）关闭 ToMe 合并，与其他臂同分布可比
 
         epoch_losstrain = running_loss / len(trainset)
         epoch_acctrain = running_corrects.double() / len(trainset)
@@ -624,12 +664,13 @@ def main():
     parser.add_argument('--modelname', type=str, default='ViT-B/16', help='仅支持 ViT-B/16（fcdim=512）')
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--seed', type=int, default=43)
-    parser.add_argument('--mode', type=str, default='joint', choices=['joint', 'twostage', 'pure', 'genscl', 'paco', 'spread', 'pacoplus'],
+    parser.add_argument('--mode', type=str, default='joint', choices=['joint', 'twostage', 'pure', 'genscl', 'paco', 'spread', 'pacoplus', 'mergemix'],
                         help='joint=CE+w·SupCon 联合单循环；twostage=SupCon 预训练+CE 两阶段；'
                              'pure=纯 SupCon+kNN 评估；genscl=CE+w·GenSCL（Eq.2 复刻，骨架同 joint）；'
                              'paco=官方口径 PaCo 单损失（中心=fc 权重+BS 内嵌，无独立 CE）；'
                              'spread=THANOS L_spread（CE+w·[(1-α)SupCon+α·cNCE]，唯一带增强的臂）；'
-                             'pacoplus=CE+w·官方 PaCo（BS 保留，项目本土化混合，官方无此组合）')
+                             'pacoplus=CE+w·官方 PaCo（BS 保留，项目本土化混合，官方无此组合）；'
+                             'mergemix=MergeMix 论文原版 Eq.9（ToMe 掩码 mixup + λ̂ 重缩放，纯分类损失）')
     parser.add_argument('--knn_k', type=int, default=20, help='pure 模式 kNN 的邻居数 k')
     parser.add_argument('--num_epochs', type=int, default=25, help='joint/pure 模式总轮数')
     parser.add_argument('--stage1_epochs', type=int, default=25, help='twostage 阶段一（SupCon 预训练）轮数')
@@ -645,6 +686,11 @@ def main():
     parser.add_argument('--spread_alpha', type=float, default=0.5,
                         help='spread 模式 cNCE 权重 α：L=(1-α)·L_sup+α·cNCE（官方实验配置 a_lc=a_spread=1 → α=0.5；'
                              '论文理论 spread 区 α>2/3 与官方配置不一致，按官方代码为准；α=0 退化为纯 L_in 版 SupCon）')
+    parser.add_argument('--mm_r', type=int, default=8,
+                        help='mergemix 模式每层 ToMe 合并 token 数（197 token / 12 层下 r=8 约压缩 48%；'
+                             'r=0 即论文 Table 7 的 TopK 消融版；评估时强制 r=0）')
+    parser.add_argument('--mm_alpha', type=float, default=1.0,
+                        help='mergemix 模式 Beta(α,α) 混合比例分布参数（论文 Table 1 口径 α=1.0）')
     parser.add_argument('--lr_BB', type=float, default=1e-6)
     parser.add_argument('--lr_FC', type=float, default=1e-3)
     parser.add_argument('--stepsize_BB', type=int, default=6)
@@ -672,6 +718,12 @@ def main():
 
     model, preprocess = clip.load(args.modelname, device)
     clip.model.convert_weights(model)
+    if args.mode == 'mergemix':
+        global tome_clip
+        import tome_clip
+        # OpenAI CLIP 视觉编码器打 ToMe 补丁（原地改 __class__，不复制权重；训练时 r=args.mm_r，
+        # 评估循环内强制 r=0 完全退化为原始前向；trace_source 提供 MergeMix 掩码所需的 source map）
+        tome_clip.apply_patch(model.visual, r=args.mm_r, trace_source=True)
     M.preprocess = preprocess
     fc = M.FCN(dim=512).to(device)
     proj = SupConProjector(dim=512).to(device)
@@ -685,15 +737,16 @@ def main():
 
     print("New SupCon experiment start.")
     print('mode: ' + args.mode + ' tau: ' + str(args.temperature) + ' supcon_weight: ' + str(args.supcon_weight)
-          + ' paco_alpha: ' + str(args.paco_alpha) + ' spread_alpha: ' + str(args.spread_alpha))
+          + ' paco_alpha: ' + str(args.paco_alpha) + ' spread_alpha: ' + str(args.spread_alpha)
+          + ' mm_r: ' + str(args.mm_r) + ' mm_alpha: ' + str(args.mm_alpha))
     starttime = time.strftime('%Y%m%d%H%M%S')
     print(starttime)
     startpoint = time.time()
 
-    if args.mode in ('joint', 'genscl', 'paco', 'spread', 'pacoplus'):
+    if args.mode in ('joint', 'genscl', 'paco', 'spread', 'pacoplus', 'mergemix'):
         train_joint(args, classtype, device, trainset, valset, testset, model, fc, proj, log)
         tag = {'joint': 'supconjoint', 'genscl': 'supcongenscl', 'paco': 'supconpaco',
-               'spread': 'supconspread', 'pacoplus': 'supconpacoplus'}[args.mode]
+               'spread': 'supconspread', 'pacoplus': 'supconpacoplus', 'mergemix': 'supconmergemix'}[args.mode]
     elif args.mode == 'twostage':
         train_twostage(args, classtype, device, trainset, valset, testset, model, fc, proj, log)
         tag = 'supcon2stage'
@@ -710,6 +763,7 @@ def main():
                 + ' tau:' + str(args.temperature) + ' w:' + str(args.supcon_weight) \
                 + ' paco_alpha:' + str(args.paco_alpha) \
                 + ' spread_alpha:' + str(args.spread_alpha) \
+                + ' mm_r:' + str(args.mm_r) + ' mm_alpha:' + str(args.mm_alpha) \
                 + ' knn_k:' + str(args.knn_k) \
                 + ' lr_FC:' + str(args.lr_FC) + ' stepsize_FC:' + str(args.stepsize_FC) \
                 + ' gamma_FC' + str(args.gamma_FC) + ' lr_BB:' + str(args.lr_BB) \
