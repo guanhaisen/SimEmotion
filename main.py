@@ -102,7 +102,7 @@ def get_features(traindataset, valdataset):
         for images, labels in tqdm(DataLoader(traindataset, batch_size=args.batch_size, shuffle=True)):
             images = images.to(device)
             labels = labels.to(device)
-            if epoch >= args.warmepoch:
+            if epoch >= args.warmepoch and args.loss != 'vpt':
                 optimizer.zero_grad()
             optimizer_fc.zero_grad()
             with torch.set_grad_enabled(True):
@@ -111,7 +111,9 @@ def get_features(traindataset, valdataset):
                 loss = criterion(outputs, labels)
                 _, preds = torch.max(outputs, 1)
                 loss.backward()
-                if epoch >= args.warmepoch:
+                if epoch >= args.warmepoch and args.loss != 'vpt':
+                    # VPT 臂跳过：backbone 全程冻结无可步进参数（convert_models_to_fp32 会因 grad=None 崩溃）；
+                    # P token 梯度已随 backward 回传，由 optimizer_fc.step() 统一更新
                     convert_models_to_fp32(model.visual)
                     optimizer.step()
                     clip.model.convert_weights(model.visual)
@@ -125,7 +127,7 @@ def get_features(traindataset, valdataset):
         log.append(loginfo + '\n')
         print(loginfo)
 
-        if epoch >= args.warmepoch:
+        if epoch >= args.warmepoch and args.loss != 'vpt':
             scheduler.step()
         scheduler_fc.step()
         if valdataset is not None:
@@ -238,6 +240,57 @@ class FCN(nn.Module):
         x = self.classifier(x)
 
         return x
+
+
+class VPTVisual(nn.Module):
+    """VPT（Visual Prompt Tuning, Jia et al. ECCV 2022）Shallow 变体：
+    在冻结 CLIP ViT 的 patch 序列中插入 L 个可学习 prompt token。
+    序列布局 [CLS, P_1..P_L, patch_1..patch_N]：P 拥有独立可学习位置编码 prompt_pos，
+    CLS/patch 沿用原 positional_embedding。仅 prompt/prompt_pos 可训练（约 L×768×2 参数），
+    梯度经冻结注意力层回流至 P——前向严禁包 no_grad（optimizer_fc 同时更新 fc 头与 P）。
+    与 MASP（AAAI-26）软提示同思想的视觉侧落地：MASP 把可学习 token 拼在 LLM 输入前，
+    VPT 拼在 ViT patch 序列前。注意 prompt 参数保持 fp32（Adam 数值稳定），前向时 .to(x.dtype)
+    对齐 fp16 主干；本类必须在 clip.model.convert_weights(model) 之后包装。"""
+
+    def __init__(self, visual, vpt_l=32):
+        super().__init__()
+        self.vt = visual
+        self.vpt_l = vpt_l
+        width = visual.transformer.width
+        self.prompt = nn.Parameter(torch.randn(vpt_l, width) * 0.02)
+        self.prompt_pos = nn.Parameter(torch.zeros(vpt_l, width))
+        for p in self.vt.parameters():
+            p.requires_grad_(False)
+
+    @property
+    def input_resolution(self):
+        return self.vt.input_resolution          # --aug 与 clip._transform 需要
+
+    @property
+    def conv1(self):
+        # CLIP.dtype property 内部访问 self.visual.conv1.weight.dtype——包装后必须透传，
+        # 否则 encode_image 的 image.type(self.dtype) 会报 "'CLIP' object has no attribute 'dtype'"
+        return self.vt.conv1
+
+    def forward(self, x):
+        vt = self.vt
+        x = vt.conv1(x)                                               # [B, d, g, g]
+        x = x.reshape(x.shape[0], x.shape[1], -1).permute(0, 2, 1)    # [B, N, d]
+        cls = vt.class_embedding.to(x.dtype) + torch.zeros(
+            x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device)
+        x = torch.cat([cls, x], dim=1)                                # [B, 1+N, d]
+        P = self.prompt.to(x.dtype).unsqueeze(0).expand(x.shape[0], -1, -1)   # 内容=prompt，位置=prompt_pos
+        x = torch.cat([x[:, :1, :], P, x[:, 1:, :]], dim=1)           # [B, 1+L+N, d]
+        pos = torch.cat([vt.positional_embedding[:1].to(x.dtype).unsqueeze(0).expand(x.shape[0], -1, -1),
+                         self.prompt_pos.to(x.dtype).unsqueeze(0).expand(x.shape[0], -1, -1),
+                         vt.positional_embedding[1:].to(x.dtype).unsqueeze(0).expand(x.shape[0], -1, -1)],
+                        dim=1)  # 对齐 [CLS, P, patch]，各段补 batch 维后沿序列维拼接
+        x = vt.ln_pre(x + pos)
+        x = x.permute(1, 0, 2)                                        # NLD -> LND
+        x = vt.transformer(x)
+        x = x.permute(1, 0, 2)                                        # LND -> NLD
+        x = vt.ln_post(x[:, 0, :])
+        return x @ vt.proj
 
 
 # WiSE-FT --wise_init 的零样本 prompt 模板（每类对全部模板取平均嵌入；可按需增删）
@@ -440,7 +493,9 @@ if __name__ == '__main__':
     parser.add_argument('--no_val', action='store_true',
                         help='小数据集 k 折协议：不加载 val、不做 best-val 选择，训满 num_epochs 用最后一轮权重做 FinalTest'
                              '（要求 datadir 下无 val/ 也不报错；逐轮 Test 日志仍记录，仅供画曲线，不用于选模型）')
-    parser.add_argument('--loss', type=str, default='ce', choices=['ce', 'fal', 'listmle', 'fal_listmle', 'ce_fal_mle', 'dist_fal', 'wce'], help='监督损失：ce=交叉熵，fal=fuzzy-aware loss（FAL），listmle=CE+λ·ListMLE情绪序约束，fal_listmle=FAL+λ·p_ŷ·ListMLE组合，ce_fal_mle=CE+模糊项+ListMLE无调制三合一，dist_fal=方案B距离软标签FAL（τ=1.0），wce=类频率倒数加权CE（PaCo哨兵臂）')
+    parser.add_argument('--loss', type=str, default='ce', choices=['ce', 'fal', 'listmle', 'fal_listmle', 'ce_fal_mle', 'dist_fal', 'wce', 'vpt'], help='监督损失：ce=交叉熵，fal=fuzzy-aware loss（FAL），listmle=CE+λ·ListMLE情绪序约束，fal_listmle=FAL+λ·p_ŷ·ListMLE组合，ce_fal_mle=CE+模糊项+ListMLE无调制三合一，dist_fal=方案B距离软标签FAL（τ=1.0），wce=类频率倒数加权CE（PaCo哨兵臂），vpt=VPT视觉提示臂（CE损失+冻结ViT+可学习prompt token，Jia et al. 2022，见 --vpt_l；测试脚本需加 --vpt）')
+    parser.add_argument('--vpt_l', type=int, default=32,
+                        help='VPT 臂的 prompt token 数 L（仅 --loss vpt 生效，默认 32 与 MASP 软提示同量级）；测试脚本需加 --vpt --vpt_l <L>')
     args = parser.parse_args()
     if args.datadir and not args.datadir.endswith('/'):
         args.datadir += '/'   # 路径按字符串拼接，结尾斜杠必须补齐
@@ -458,6 +513,11 @@ if __name__ == '__main__':
     else:
         fc = FCN(dim=fcdim).to(device)
     args.modelname = args.modelname.replace('/', '-')
+
+    # VPT 臂：冻结 ViT，patch 序列中插入可学习 prompt token（Jia et al. 2022 Shallow 变体）
+    # 必须在 clip.model.convert_weights(model) 之后包装：主干保持 fp16，prompt 参数保持 fp32
+    if args.loss == 'vpt':
+        model.visual = VPTVisual(model.visual, vpt_l=args.vpt_l).to(device)
 
     # --aug 训练增强管线（wise-ft 官方实现：RandomResizedCrop，见上方说明块）
     train_preprocess = None
@@ -497,10 +557,14 @@ if __name__ == '__main__':
     else:
         criterion = nn.CrossEntropyLoss()
     optimizer = optim.AdamW(model.visual.parameters(), lr=args.lr_BB, weight_decay=args.wd_BB)
+    # VPT 臂：P token / prompt_pos 并入 optimizer_fc 与 fc 头同组更新（backbone 冻结，optimizer 永不步进）
+    head_params = list(fc.parameters())
+    if args.loss == 'vpt':
+        head_params += [p for p in model.visual.parameters() if p.requires_grad]
     if args.wd_FC > 0:
-        optimizer_fc = optim.AdamW(fc.parameters(), lr=args.lr_FC, weight_decay=args.wd_FC)  # WiSE-FT 配方
+        optimizer_fc = optim.AdamW(head_params, lr=args.lr_FC, weight_decay=args.wd_FC)  # WiSE-FT 配方
     else:
-        optimizer_fc = optim.Adam(fc.parameters(), lr=args.lr_FC)
+        optimizer_fc = optim.Adam(head_params, lr=args.lr_FC)
     scheduler = lr_scheduler.StepLR(optimizer, step_size=args.stepsize_BB, gamma=args.gamma_BB)
     scheduler_fc = lr_scheduler.StepLR(optimizer_fc, step_size=args.stepsize_FC, gamma=args.gamma_FC)
 
@@ -522,6 +586,7 @@ if __name__ == '__main__':
                 + ' seed:' + str(args.seed) + ' wd_FC:' + str(args.wd_FC) \
                 + (' wise_init:True' if args.wise_init else '') \
                 + (' aug:True' if args.aug else '') \
+                + (' vpt_l:' + str(args.vpt_l) if args.loss == 'vpt' else '') \
                 + (' no_val:True' if args.no_val else '') \
                 + (' datadir:' + args.datadir if args.datadir else '')
     print(paraminfo)

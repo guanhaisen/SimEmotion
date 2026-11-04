@@ -33,6 +33,13 @@
                     （与其他臂同分布可比）；本项目唯一 mixup 类增强臂；
                     每步双前向（原图抓注意力 + 混合图算损失），耗时约 joint 的 1.8 倍；
                     对比项/投影头不参与本臂损失（论文纯分类口径，proj 仅随三件套保存）
+  pacomix         : 用户指定的 PaCo+MergeMix 直接组合：
+                    L = λ̂·CE(fc(f(x̂)),y_i) + (1−λ̂)·CE(fc(f(x̂)),y_j) + PaCo(proj(f(x)),y,fc(f(x)))
+                    即 mergemix 的混合 CE 项 + paco 官方单损失（删掉干净图 plain CE，由 PaCo 顶替）——
+                    与 pacoplus 的关键区别：fc 对同一输入只有一种信号（干净图→BS-CE、混合图→plain CE），
+                    不同输入不同信号属"输入侧正则"而非同输入双信号病理；
+                    ToMe 补丁/掩码混合/λ̂ 重缩放/双前向/评估 r=0 全部与 mergemix 相同；
+                    mix-CE 的 −0.77pp 净害处（mergemix 臂已测）仍在此臂中，预期 ≤ paco
 
 与文献标准 SupCon 的已知偏离（写实验记录时必须注明）:
   - 不加数据增强：本项目所有臂的训练管线均无增强，SupCon 臂保持一致以保臂间公平
@@ -48,6 +55,7 @@
   python supcon.py --mode paco --num_epochs 25 --paco_alpha 0.05 --seed 43 --datadir FI_seed43
   python supcon.py --mode spread --num_epochs 25 --spread_alpha 0.7 --seed 43 --datadir FI_seed43
   python supcon.py --mode mergemix --num_epochs 25 --mm_r 8 --seed 43 --datadir FI_seed43
+  python supcon.py --mode pacomix --num_epochs 25 --mm_r 8 --paco_alpha 0.05 --seed 43 --datadir FI_seed43
 
 说明:
   - 复用 main.py 的数据/模型/评估逻辑（import main as M 注入模式，同 test_saved_model.py）；
@@ -366,14 +374,17 @@ def train_joint(args, classtype, device, trainset, valset, testset, model, fc, p
     L = λ̂·CE(fc(f(x̂)),y_i) + (1−λ̂)·CE(fc(f(x̂)),y_j) + CE(fc(f(x)),y)，
     掩码由干净图前向顺带快照的最后一层 CLS 注意力恢复生成（零额外前向），
     混合图走第二次前向（~1.8× 开销同 spread）；对比项/投影头不参与损失；
-    训练时 visual.r=args.mm_r，评估（run_val/get_features_test）强制 r=0"""
+    训练时 visual.r=args.mm_r，评估（run_val/get_features_test）强制 r=0；
+    pacomix 模式：同款混合 CE + PaCoLoss(干净图) 单损失（替代干净图 plain CE），
+    fc 对同一输入只有一种信号（干净图→BS-CE、混合图→plain CE），规避 pacoplus 式双信号病理"""
     criterion = nn.CrossEntropyLoss()
     paco = None
     spread_criterion = None
     if args.mode == 'genscl':
         supcon_criterion = GenSCLLoss(temperature=args.temperature)
-    elif args.mode in ('paco', 'pacoplus'):
+    elif args.mode in ('paco', 'pacoplus', 'pacomix'):
         # 类频率 q(y) = n_c/N（与 main.py wce 哨兵臂同口径），Balanced Softmax 内嵌于中心=fc 项
+        # （pacomix 复用同一 PaCoLoss 作为干净图侧的单损失）
         counts = [sum(1 for _, l in trainset.images if l == c) for c in classtype]
         q = torch.tensor([n / max(sum(counts), 1) for n in counts], dtype=torch.float32)
         paco = PaCoLoss(temperature=args.temperature, alpha=args.paco_alpha,
@@ -412,7 +423,7 @@ def train_joint(args, classtype, device, trainset, valset, testset, model, fc, p
                 images, labels = batch
             images = images.to(device)
             labels = labels.to(device)
-            if args.mode == 'mergemix':
+            if args.mode in ('mergemix', 'pacomix'):
                 model.visual.r = args.mm_r   # 训练时开 ToMe 合并（评估前关闭）
             if epoch >= args.warmepoch:
                 optimizer.zero_grad()
@@ -438,6 +449,25 @@ def train_joint(args, classtype, device, trainset, valset, testset, model, fc, p
                     ce_mix = F.cross_entropy(out_mix, labels, reduction='none') * lam_hat \
                         + F.cross_entropy(out_mix, labels[perm], reduction='none') * (1.0 - lam_hat)
                     loss = ce_mix.mean() + criterion(outputs, labels)
+                elif args.mode == 'pacomix':
+                    # ---- pacomix：mix-CE（只对混合图）+ PaCo 官方单损失（干净图）----
+                    # 用户指定的直接组合：L = λ̂·CE(x̂,y_i) + (1−λ̂)·CE(x̂,y_j) + PaCo(f(x),y)
+                    # 与 pacoplus 的关键区别：fc 对同一输入只有一种信号（干净图→BS-CE，
+                    # 混合图→plain CE），不同输入不同信号属"输入侧正则"而非同输入双信号病理；
+                    # 但 mix-CE 的 −0.77pp 净害处（mergemix 臂）仍在此臂中存在，预期 ≤ paco
+                    info = model.visual._tome_info
+                    attn_L = tome_clip.recover_cls_attention(info)          # (B, 1+196) Eq.6
+                    L_seq = attn_L.shape[1]
+                    k_final = info["source"].shape[-1] if info["source"] is not None else L_seq
+                    lam = torch.distributions.Beta(args.mm_alpha, args.mm_alpha)\
+                        .sample((images.size(0),)).to(images.device)
+                    mixed, perm, mask_tok = tome_clip.build_mix(images, attn_L, lam)  # Eq.2/7
+                    feat_mix = model.encode_image(mixed).float()   # 混合图第二次前向
+                    out_mix = fc(feat_mix)
+                    lam_hat = tome_clip.rescale_lambda(k_final, L_seq, mask_tok)       # Eq.8
+                    ce_mix = F.cross_entropy(out_mix, labels, reduction='none') * lam_hat \
+                        + F.cross_entropy(out_mix, labels[perm], reduction='none') * (1.0 - lam_hat)
+                    loss = ce_mix.mean() + supcon_criterion(proj(features), labels, outputs)
                 elif args.mode == 'paco':
                     # 官方口径 PaCo 单损失：中心=fc 权重、BS 内嵌，无独立 CE、无 w
                     loss = supcon_criterion(proj(features), labels, outputs)
@@ -465,7 +495,7 @@ def train_joint(args, classtype, device, trainset, valset, testset, model, fc, p
             running_loss += loss.item() * features.size(0)
             running_corrects += torch.sum(preds == labels.data)
 
-        if args.mode == 'mergemix':
+        if args.mode in ('mergemix', 'pacomix'):
             model.visual.r = 0   # 评估（run_val / get_features_test）关闭 ToMe 合并，与其他臂同分布可比
 
         epoch_losstrain = running_loss / len(trainset)
@@ -664,13 +694,14 @@ def main():
     parser.add_argument('--modelname', type=str, default='ViT-B/16', help='仅支持 ViT-B/16（fcdim=512）')
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--seed', type=int, default=43)
-    parser.add_argument('--mode', type=str, default='joint', choices=['joint', 'twostage', 'pure', 'genscl', 'paco', 'spread', 'pacoplus', 'mergemix'],
+    parser.add_argument('--mode', type=str, default='joint', choices=['joint', 'twostage', 'pure', 'genscl', 'paco', 'spread', 'pacoplus', 'mergemix', 'pacomix'],
                         help='joint=CE+w·SupCon 联合单循环；twostage=SupCon 预训练+CE 两阶段；'
                              'pure=纯 SupCon+kNN 评估；genscl=CE+w·GenSCL（Eq.2 复刻，骨架同 joint）；'
                              'paco=官方口径 PaCo 单损失（中心=fc 权重+BS 内嵌，无独立 CE）；'
                              'spread=THANOS L_spread（CE+w·[(1-α)SupCon+α·cNCE]，唯一带增强的臂）；'
                              'pacoplus=CE+w·官方 PaCo（BS 保留，项目本土化混合，官方无此组合）；'
-                             'mergemix=MergeMix 论文原版 Eq.9（ToMe 掩码 mixup + λ̂ 重缩放，纯分类损失）')
+                             'mergemix=MergeMix 论文原版 Eq.9（ToMe 掩码 mixup + λ̂ 重缩放，纯分类损失）；'
+                             'pacomix=mix-CE（只对混合图）+ PaCo 官方单损失（干净图）')
     parser.add_argument('--knn_k', type=int, default=20, help='pure 模式 kNN 的邻居数 k')
     parser.add_argument('--num_epochs', type=int, default=25, help='joint/pure 模式总轮数')
     parser.add_argument('--stage1_epochs', type=int, default=25, help='twostage 阶段一（SupCon 预训练）轮数')
@@ -682,15 +713,15 @@ def main():
     parser.add_argument('--supcon_weight', type=float, default=0.5,
                         help='joint/genscl/spread/pacoplus 模式对比项权重 w（paco 为单损失，此参数不生效仅回显）')
     parser.add_argument('--paco_alpha', type=float, default=0.05,
-                        help='paco/pacoplus 模式样本正对权重 α（论文正文 0.05，官方脚本 default 1.0；β=γ=1 固定）')
+                        help='paco/pacoplus/pacomix 模式样本正对权重 α（论文正文 0.05，官方脚本 default 1.0；β=γ=1 固定）')
     parser.add_argument('--spread_alpha', type=float, default=0.5,
                         help='spread 模式 cNCE 权重 α：L=(1-α)·L_sup+α·cNCE（官方实验配置 a_lc=a_spread=1 → α=0.5；'
                              '论文理论 spread 区 α>2/3 与官方配置不一致，按官方代码为准；α=0 退化为纯 L_in 版 SupCon）')
     parser.add_argument('--mm_r', type=int, default=8,
-                        help='mergemix 模式每层 ToMe 合并 token 数（197 token / 12 层下 r=8 约压缩 48%；'
+                        help='mergemix/pacomix 模式每层 ToMe 合并 token 数（197 token / 12 层下 r=8 约压缩 48%；'
                              'r=0 即论文 Table 7 的 TopK 消融版；评估时强制 r=0）')
     parser.add_argument('--mm_alpha', type=float, default=1.0,
-                        help='mergemix 模式 Beta(α,α) 混合比例分布参数（论文 Table 1 口径 α=1.0）')
+                        help='mergemix/pacomix 模式 Beta(α,α) 混合比例分布参数（论文 Table 1 口径 α=1.0）')
     parser.add_argument('--lr_BB', type=float, default=1e-6)
     parser.add_argument('--lr_FC', type=float, default=1e-3)
     parser.add_argument('--stepsize_BB', type=int, default=6)
@@ -718,7 +749,7 @@ def main():
 
     model, preprocess = clip.load(args.modelname, device)
     clip.model.convert_weights(model)
-    if args.mode == 'mergemix':
+    if args.mode in ('mergemix', 'pacomix'):
         global tome_clip
         import tome_clip
         # OpenAI CLIP 视觉编码器打 ToMe 补丁（原地改 __class__，不复制权重；训练时 r=args.mm_r，
@@ -743,10 +774,11 @@ def main():
     print(starttime)
     startpoint = time.time()
 
-    if args.mode in ('joint', 'genscl', 'paco', 'spread', 'pacoplus', 'mergemix'):
+    if args.mode in ('joint', 'genscl', 'paco', 'spread', 'pacoplus', 'mergemix', 'pacomix'):
         train_joint(args, classtype, device, trainset, valset, testset, model, fc, proj, log)
         tag = {'joint': 'supconjoint', 'genscl': 'supcongenscl', 'paco': 'supconpaco',
-               'spread': 'supconspread', 'pacoplus': 'supconpacoplus', 'mergemix': 'supconmergemix'}[args.mode]
+               'spread': 'supconspread', 'pacoplus': 'supconpacoplus', 'mergemix': 'supconmergemix',
+               'pacomix': 'supconpacomix'}[args.mode]
     elif args.mode == 'twostage':
         train_twostage(args, classtype, device, trainset, valset, testset, model, fc, proj, log)
         tag = 'supcon2stage'

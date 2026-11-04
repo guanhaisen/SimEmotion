@@ -18,6 +18,9 @@
   # WiSE-FT 臂（main.py --wise_init 训练的单层线性头 + 特征 L2 归一化）：
   python test_saved_model.py <ts> --datadir FI_seed43 --wise_init
 
+  # VPT 臂（main.py --loss vpt --vpt_l 32 训练的冻结 ViT + 可学习 prompt token）：
+  python test_saved_model.py <ts> --datadir FI_seed43 --vpt --vpt_l 32
+
 说明:
 - 复用 main.py 的数据/模型定义（Loaddata / FCN / get_features_test / f1_from_matrix），
   保证与训练时的测试逻辑完全一致；
@@ -106,6 +109,10 @@ def main():
     parser.add_argument('--knn_k', type=int, default=20, help='pure 两件套的 kNN 邻居数')
     parser.add_argument('--wise_init', action='store_true',
                         help='WiSE-FT 臂（main.py --wise_init 训练）：单层线性头 + 图像特征 L2 归一化，须与训练时一致')
+    parser.add_argument('--vpt', action='store_true',
+                        help='VPT 臂（main.py --loss vpt 训练）：冻结 ViT + 可学习 prompt token，须与训练时一致')
+    parser.add_argument('--vpt_l', type=int, default=32,
+                        help='VPT prompt token 数 L，须与训练时 --vpt_l 一致')
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -135,6 +142,9 @@ def main():
         mpath, fpath = find_main_checkpoint(args.timestamp, args.datasetname)
         print("model 权重:", mpath)
         print("fc 权重   :", fpath)
+        if args.vpt:
+            # VPT 臂：必须先包装再载入（state_dict 含 visual.prompt / visual.prompt_pos / visual.vt.* 键）
+            model.visual = M.VPTVisual(model.visual, vpt_l=args.vpt_l)
         model.load_state_dict(torch.load(mpath, map_location="cpu"))
         model = model.to(device).eval()
         fc_sd = torch.load(fpath, map_location="cpu")
