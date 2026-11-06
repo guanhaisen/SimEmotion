@@ -1,0 +1,337 @@
+# Abstract split seed43 stratified 60/20/20（与 ArtPhoto 同协议）
+# 标签规则: CSV 8 类票数 argmax；并列图 seed43 随机分配（下列清单）
+# 局限: test 56 张噪声带 ±5-6pp；anger test≈2 张 per-class 无意义
+# train=168 val=56 test=56
+train	amusement	abstract_0029.jpg
+train	amusement	abstract_0034.jpg
+train	amusement	abstract_0037.jpg
+train	amusement	abstract_0047.jpg
+train	amusement	abstract_0092.jpg
+train	amusement	abstract_0099.jpg
+train	amusement	abstract_0103.jpg
+train	amusement	abstract_0129.jpg
+train	amusement	abstract_0135.jpg
+train	amusement	abstract_0148.jpg
+train	amusement	abstract_0150.jpg
+train	amusement	abstract_0163.jpg
+train	amusement	abstract_0187.jpg
+train	amusement	abstract_0192.jpg
+train	amusement	abstract_0208.jpg
+train	amusement	abstract_0246.jpg
+train	amusement	abstract_0253.jpg
+train	anger	abstract_0003.jpg
+train	anger	abstract_0081.jpg
+train	anger	abstract_0172.jpg
+train	anger	abstract_0252.jpg
+train	awe	abstract_0032.jpg
+train	awe	abstract_0059.jpg
+train	awe	abstract_0077.jpg
+train	awe	abstract_0080.jpg
+train	awe	abstract_0084.jpg
+train	awe	abstract_0121.jpg
+train	awe	abstract_0123.jpg
+train	awe	abstract_0180.jpg
+train	awe	abstract_0198.jpg
+train	awe	abstract_0213.jpg
+train	awe	abstract_0236.jpg
+train	awe	abstract_0243.jpg
+train	awe	abstract_0257.jpg
+train	contentment	abstract_0001.jpg
+train	contentment	abstract_0006.jpg
+train	contentment	abstract_0009.jpg
+train	contentment	abstract_0014.jpg
+train	contentment	abstract_0038.jpg
+train	contentment	abstract_0049.jpg
+train	contentment	abstract_0056.jpg
+train	contentment	abstract_0061.jpg
+train	contentment	abstract_0078.jpg
+train	contentment	abstract_0086.jpg
+train	contentment	abstract_0095.jpg
+train	contentment	abstract_0105.jpg
+train	contentment	abstract_0111.jpg
+train	contentment	abstract_0116.jpg
+train	contentment	abstract_0119.jpg
+train	contentment	abstract_0125.jpg
+train	contentment	abstract_0126.jpg
+train	contentment	abstract_0128.jpg
+train	contentment	abstract_0130.jpg
+train	contentment	abstract_0133.jpg
+train	contentment	abstract_0134.jpg
+train	contentment	abstract_0141.jpg
+train	contentment	abstract_0142.jpg
+train	contentment	abstract_0147.jpg
+train	contentment	abstract_0165.jpg
+train	contentment	abstract_0166.jpg
+train	contentment	abstract_0168.jpg
+train	contentment	abstract_0173.jpg
+train	contentment	abstract_0176.jpg
+train	contentment	abstract_0188.jpg
+train	contentment	abstract_0197.jpg
+train	contentment	abstract_0202.jpg
+train	contentment	abstract_0210.jpg
+train	contentment	abstract_0212.jpg
+train	contentment	abstract_0227.jpg
+train	contentment	abstract_0237.jpg
+train	contentment	abstract_0250.jpg
+train	contentment	abstract_0266.jpg
+train	contentment	abstract_0271.jpg
+train	contentment	abstract_0276.jpg
+train	contentment	abstract_0278.jpg
+train	contentment	abstract_0279.jpg
+train	disgust	abstract_0019.jpg
+train	disgust	abstract_0022.jpg
+train	disgust	abstract_0046.jpg
+train	disgust	abstract_0065.jpg
+train	disgust	abstract_0085.jpg
+train	disgust	abstract_0089.jpg
+train	disgust	abstract_0093.jpg
+train	disgust	abstract_0113.jpg
+train	disgust	abstract_0164.jpg
+train	disgust	abstract_0174.jpg
+train	disgust	abstract_0201.jpg
+train	disgust	abstract_0204.jpg
+train	disgust	abstract_0205.jpg
+train	disgust	abstract_0258.jpg
+train	disgust	abstract_0269.jpg
+train	excitement	abstract_0012.jpg
+train	excitement	abstract_0018.jpg
+train	excitement	abstract_0026.jpg
+train	excitement	abstract_0041.jpg
+train	excitement	abstract_0050.jpg
+train	excitement	abstract_0098.jpg
+train	excitement	abstract_0108.jpg
+train	excitement	abstract_0109.jpg
+train	excitement	abstract_0115.jpg
+train	excitement	abstract_0118.jpg
+train	excitement	abstract_0124.jpg
+train	excitement	abstract_0154.jpg
+train	excitement	abstract_0160.jpg
+train	excitement	abstract_0182.jpg
+train	excitement	abstract_0189.jpg
+train	excitement	abstract_0190.jpg
+train	excitement	abstract_0209.jpg
+train	excitement	abstract_0220.jpg
+train	excitement	abstract_0221.jpg
+train	excitement	abstract_0229.jpg
+train	excitement	abstract_0238.jpg
+train	excitement	abstract_0245.jpg
+train	excitement	abstract_0265.jpg
+train	excitement	abstract_0274.jpg
+train	excitement	abstract_0282.jpg
+train	fear	abstract_0028.jpg
+train	fear	abstract_0042.jpg
+train	fear	abstract_0048.jpg
+train	fear	abstract_0052.jpg
+train	fear	abstract_0055.jpg
+train	fear	abstract_0057.jpg
+train	fear	abstract_0058.jpg
+train	fear	abstract_0060.jpg
+train	fear	abstract_0062.jpg
+train	fear	abstract_0074.jpg
+train	fear	abstract_0112.jpg
+train	fear	abstract_0159.jpg
+train	fear	abstract_0169.jpg
+train	fear	abstract_0170.jpg
+train	fear	abstract_0178.jpg
+train	fear	abstract_0183.jpg
+train	fear	abstract_0185.jpg
+train	fear	abstract_0191.jpg
+train	fear	abstract_0196.jpg
+train	fear	abstract_0199.jpg
+train	fear	abstract_0203.jpg
+train	fear	abstract_0214.jpg
+train	fear	abstract_0216.jpg
+train	fear	abstract_0233.jpg
+train	fear	abstract_0259.jpg
+train	fear	abstract_0280.jpg
+train	sadness	abstract_0007.jpg
+train	sadness	abstract_0011.jpg
+train	sadness	abstract_0023.jpg
+train	sadness	abstract_0051.jpg
+train	sadness	abstract_0067.jpg
+train	sadness	abstract_0072.jpg
+train	sadness	abstract_0076.jpg
+train	sadness	abstract_0082.jpg
+train	sadness	abstract_0097.jpg
+train	sadness	abstract_0101.jpg
+train	sadness	abstract_0131.jpg
+train	sadness	abstract_0139.jpg
+train	sadness	abstract_0140.jpg
+train	sadness	abstract_0157.jpg
+train	sadness	abstract_0171.jpg
+train	sadness	abstract_0195.jpg
+train	sadness	abstract_0219.jpg
+train	sadness	abstract_0223.jpg
+train	sadness	abstract_0241.jpg
+train	sadness	abstract_0242.jpg
+train	sadness	abstract_0262.jpg
+train	sadness	abstract_0263.jpg
+train	sadness	abstract_0264.jpg
+train	sadness	abstract_0268.jpg
+train	sadness	abstract_0275.jpg
+train	sadness	abstract_0283.jpg
+val	amusement	abstract_0138.jpg
+val	amusement	abstract_0156.jpg
+val	amusement	abstract_0200.jpg
+val	amusement	abstract_0254.jpg
+val	amusement	abstract_0255.jpg
+val	amusement	abstract_0267.jpg
+val	anger	abstract_0175.jpg
+val	awe	abstract_0063.jpg
+val	awe	abstract_0100.jpg
+val	awe	abstract_0114.jpg
+val	awe	abstract_0177.jpg
+val	awe	abstract_0194.jpg
+val	contentment	abstract_0002.jpg
+val	contentment	abstract_0010.jpg
+val	contentment	abstract_0033.jpg
+val	contentment	abstract_0035.jpg
+val	contentment	abstract_0070.jpg
+val	contentment	abstract_0102.jpg
+val	contentment	abstract_0106.jpg
+val	contentment	abstract_0122.jpg
+val	contentment	abstract_0127.jpg
+val	contentment	abstract_0144.jpg
+val	contentment	abstract_0146.jpg
+val	contentment	abstract_0207.jpg
+val	contentment	abstract_0234.jpg
+val	contentment	abstract_0247.jpg
+val	disgust	abstract_0094.jpg
+val	disgust	abstract_0149.jpg
+val	disgust	abstract_0152.jpg
+val	disgust	abstract_0161.jpg
+val	disgust	abstract_0211.jpg
+val	excitement	abstract_0031.jpg
+val	excitement	abstract_0044.jpg
+val	excitement	abstract_0045.jpg
+val	excitement	abstract_0104.jpg
+val	excitement	abstract_0137.jpg
+val	excitement	abstract_0151.jpg
+val	excitement	abstract_0179.jpg
+val	excitement	abstract_0224.jpg
+val	fear	abstract_0025.jpg
+val	fear	abstract_0027.jpg
+val	fear	abstract_0069.jpg
+val	fear	abstract_0110.jpg
+val	fear	abstract_0155.jpg
+val	fear	abstract_0184.jpg
+val	fear	abstract_0222.jpg
+val	fear	abstract_0244.jpg
+val	fear	abstract_0251.jpg
+val	sadness	abstract_0008.jpg
+val	sadness	abstract_0040.jpg
+val	sadness	abstract_0158.jpg
+val	sadness	abstract_0167.jpg
+val	sadness	abstract_0228.jpg
+val	sadness	abstract_0272.jpg
+val	sadness	abstract_0273.jpg
+val	sadness	abstract_0277.jpg
+test	amusement	abstract_0020.jpg
+test	amusement	abstract_0039.jpg
+test	amusement	abstract_0079.jpg
+test	amusement	abstract_0087.jpg
+test	amusement	abstract_0232.jpg
+test	amusement	abstract_0261.jpg
+test	anger	abstract_0215.jpg
+test	awe	abstract_0088.jpg
+test	awe	abstract_0091.jpg
+test	awe	abstract_0096.jpg
+test	awe	abstract_0186.jpg
+test	awe	abstract_0260.jpg
+test	contentment	abstract_0005.jpg
+test	contentment	abstract_0015.jpg
+test	contentment	abstract_0030.jpg
+test	contentment	abstract_0075.jpg
+test	contentment	abstract_0083.jpg
+test	contentment	abstract_0120.jpg
+test	contentment	abstract_0136.jpg
+test	contentment	abstract_0145.jpg
+test	contentment	abstract_0162.jpg
+test	contentment	abstract_0231.jpg
+test	contentment	abstract_0239.jpg
+test	contentment	abstract_0248.jpg
+test	contentment	abstract_0256.jpg
+test	contentment	abstract_0281.jpg
+test	disgust	abstract_0036.jpg
+test	disgust	abstract_0068.jpg
+test	disgust	abstract_0117.jpg
+test	disgust	abstract_0132.jpg
+test	disgust	abstract_0249.jpg
+test	excitement	abstract_0013.jpg
+test	excitement	abstract_0021.jpg
+test	excitement	abstract_0053.jpg
+test	excitement	abstract_0064.jpg
+test	excitement	abstract_0066.jpg
+test	excitement	abstract_0153.jpg
+test	excitement	abstract_0181.jpg
+test	excitement	abstract_0270.jpg
+test	fear	abstract_0016.jpg
+test	fear	abstract_0043.jpg
+test	fear	abstract_0090.jpg
+test	fear	abstract_0193.jpg
+test	fear	abstract_0217.jpg
+test	fear	abstract_0218.jpg
+test	fear	abstract_0230.jpg
+test	fear	abstract_0235.jpg
+test	fear	abstract_0240.jpg
+test	sadness	abstract_0004.jpg
+test	sadness	abstract_0054.jpg
+test	sadness	abstract_0073.jpg
+test	sadness	abstract_0107.jpg
+test	sadness	abstract_0143.jpg
+test	sadness	abstract_0206.jpg
+test	sadness	abstract_0225.jpg
+test	sadness	abstract_0226.jpg
+
+# 并列图分配清单（fname	并列类	r分配结果）
+TIE	abstract_0003.jpg	anger/excitement	anger
+TIE	abstract_0018.jpg	contentment/excitement	excitement
+TIE	abstract_0022.jpg	disgust/excitement	disgust
+TIE	abstract_0040.jpg	fear/sadness	sadness
+TIE	abstract_0048.jpg	disgust/fear	fear
+TIE	abstract_0051.jpg	awe/excitement/sadness	sadness
+TIE	abstract_0054.jpg	awe/disgust/sadness	sadness
+TIE	abstract_0059.jpg	awe/excitement	awe
+TIE	abstract_0067.jpg	disgust/sadness	sadness
+TIE	abstract_0072.jpg	fear/sadness	sadness
+TIE	abstract_0074.jpg	fear/sadness	fear
+TIE	abstract_0076.jpg	contentment/sadness	sadness
+TIE	abstract_0082.jpg	fear/sadness	sadness
+TIE	abstract_0083.jpg	awe/contentment	contentment
+TIE	abstract_0089.jpg	amusement/disgust/excitement	disgust
+TIE	abstract_0093.jpg	disgust/excitement	disgust
+TIE	abstract_0096.jpg	awe/contentment/excitement/fear	awe
+TIE	abstract_0103.jpg	amusement/disgust	amusement
+TIE	abstract_0113.jpg	disgust/fear	disgust
+TIE	abstract_0115.jpg	anger/excitement	excitement
+TIE	abstract_0121.jpg	awe/contentment	awe
+TIE	abstract_0122.jpg	contentment/sadness	contentment
+TIE	abstract_0123.jpg	awe/disgust/fear	awe
+TIE	abstract_0132.jpg	awe/disgust	disgust
+TIE	abstract_0136.jpg	contentment/excitement	contentment
+TIE	abstract_0137.jpg	amusement/excitement	excitement
+TIE	abstract_0139.jpg	disgust/sadness	sadness
+TIE	abstract_0141.jpg	contentment/sadness	contentment
+TIE	abstract_0146.jpg	amusement/contentment	contentment
+TIE	abstract_0156.jpg	amusement/fear	amusement
+TIE	abstract_0163.jpg	amusement/excitement	amusement
+TIE	abstract_0169.jpg	fear/sadness	fear
+TIE	abstract_0172.jpg	anger/contentment/excitement	anger
+TIE	abstract_0175.jpg	anger/awe/excitement	anger
+TIE	abstract_0177.jpg	awe/sadness	awe
+TIE	abstract_0179.jpg	disgust/excitement	excitement
+TIE	abstract_0185.jpg	anger/fear/sadness	fear
+TIE	abstract_0198.jpg	awe/excitement	awe
+TIE	abstract_0201.jpg	disgust/fear	disgust
+TIE	abstract_0211.jpg	disgust/excitement	disgust
+TIE	abstract_0213.jpg	awe/fear	awe
+TIE	abstract_0223.jpg	contentment/sadness	sadness
+TIE	abstract_0224.jpg	awe/disgust/excitement	excitement
+TIE	abstract_0230.jpg	disgust/fear	fear
+TIE	abstract_0233.jpg	contentment/fear	fear
+TIE	abstract_0235.jpg	anger/disgust/fear	fear
+TIE	abstract_0241.jpg	amusement/excitement/sadness	sadness
+TIE	abstract_0244.jpg	disgust/fear	fear
+TIE	abstract_0255.jpg	amusement/contentment	amusement
+TIE	abstract_0260.jpg	awe/disgust	awe
+TIE	abstract_0279.jpg	contentment/sadness	contentment

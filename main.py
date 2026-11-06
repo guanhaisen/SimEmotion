@@ -38,6 +38,19 @@ def datasetInit(datasetname):
         # 6 类；joy/surprise 不在 Mikels 8 类 → 仅支持 ce/fal（ListMLE 系与 dist_fal 会报错）
         _classtype = ['anger', 'disgust', 'fear', 'joy', 'sadness', 'surprise']
         _data_dir = args.datadir or 'D:/Coding/Python_Projects/SimEmotion/emotionroi_split/'
+    elif datasetname == 'Abstract':
+        # 8 类与 FI_8 同 taxonomy；prepare_abstract.py 已按 CSV 投票 argmax + seed43 生成 abstract_split/
+        # （51 张并列图随机分配见 abstract_split_manifest.txt；anger 全集仅 6 张 → per-class anger 无意义；
+        #   test 56 张，噪声带 ±5-6pp，结论定性为主并需同时报 test peak）
+        _classtype = ['amusement', 'anger', 'awe', 'contentment', 'disgust', 'excitement', 'fear', 'sadness']
+        _data_dir = args.datadir or 'D:/Coding/Python_Projects/SimEmotion/abstract_split/'
+    elif datasetname == 'Twitter1':
+        # 2 类（SimEmotion Twitter I：pos 769 / neg 500，1:1.54）；官方 5-fold（config twitter1269，
+        # label 0=neg / 1=pos 已由文件夹归属 100% 验证）；折目录 twitter1_fold{i}/{train,test}/{pos,neg}/
+        # 由 prepare_twitter1.py 生成，无 val → 必须配 --no_val（末轮协议）使用
+        # classtype ['neg','pos'] 使 neg=0 / pos=1 与官方标签一致；ListMLE 系仅支持 8 类 Mikels，二分类不可用
+        _classtype = ['neg', 'pos']
+        _data_dir = args.datadir or 'D:/Coding/Python_Projects/SimEmotion/twitter1_fold1/'
     else:
         raise InputException
     return _classtype, _data_dir

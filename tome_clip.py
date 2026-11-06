@@ -219,20 +219,35 @@ def recover_cls_attention(info: dict) -> torch.Tensor:
 
 @torch.no_grad()
 def build_mix(images: torch.Tensor, attn_L: torch.Tensor, lam: torch.Tensor,
-              grid: int = 14, img_size: int = 224):
+              grid: int = 14, img_size: int = 224, mask_mode: str = 'attn'):
     """TopK 掩码 + patch 级像素混合（论文 Eq.2/Eq.7）。
-    images: (B,3,H,W)；attn_L: (B, 1+grid²) 恢复后的 CLS 注意力（第 0 位是 CLS，排除）；
+    images: (B,3,H,W)；attn_L: (B, 1+grid²) 恢复后的 CLS 注意力（第 0 位是 CLS）；
     lam: (B,) 每样本混合比例。返回 (mixed, perm, mask_tok)。
-    perm 为混合伙伴置换，mixed[b] = M[b]⊙x[b] + (1-M[b])⊙x[perm[b]]。"""
+    perm 为混合伙伴置换，mixed[b] = M[b]⊙x[b] + (1-M[b])⊙x[perm[b]]。
+    mask_mode:
+      'attn' —— 注意力 TopK 选区（MergeMix 论文原版，Eq.7）
+      'rect' —— CutMix 式随机矩形选区（消融对照：单变量检验"注意力选区 vs 随机选区"，
+                面积同为 ⌊λ·196⌋，其余管线不动；矩形内取自 x_i、外部取自伙伴 x_j，与 CutMix 原版同向）"""
     B = images.size(0)
     n_patch = grid * grid
-    patch_attn = attn_L[:, 1:].float()                    # (B, 196)
-    ps = torch.floor(lam.to(patch_attn.device) * n_patch).long().clamp(0, n_patch)
-    mask_tok = torch.zeros_like(patch_attn)
-    for b in range(B):
-        if ps[b] > 0:
-            idx = patch_attn[b].topk(int(ps[b])).indices
-            mask_tok[b, idx] = 1.0
+    if mask_mode == 'rect':
+        ps = torch.floor(lam.to(images.device) * n_patch).long().clamp(0, n_patch)
+        mask_tok = torch.zeros(B, n_patch, device=images.device)
+        for b in range(B):
+            side = int(round(float(ps[b]) ** 0.5))
+            side = max(0, min(side, grid))
+            if side > 0:
+                r0 = int(torch.randint(0, grid - side + 1, (1,)).item())
+                c0 = int(torch.randint(0, grid - side + 1, (1,)).item())
+                mask_tok[b].view(grid, grid)[r0:r0 + side, c0:c0 + side] = 1.0
+    else:
+        patch_attn = attn_L[:, 1:].float()                    # (B, 196)
+        ps = torch.floor(lam.to(patch_attn.device) * n_patch).long().clamp(0, n_patch)
+        mask_tok = torch.zeros_like(patch_attn)
+        for b in range(B):
+            if ps[b] > 0:
+                idx = patch_attn[b].topk(int(ps[b])).indices
+                mask_tok[b, idx] = 1.0
     # token 掩码 -> 像素掩码（每 patch 覆盖 16×16 px）
     m = mask_tok.view(B, 1, grid, grid)
     m = m.repeat_interleave(img_size // grid, dim=2).repeat_interleave(img_size // grid, dim=3)

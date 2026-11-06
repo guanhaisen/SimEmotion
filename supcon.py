@@ -376,7 +376,12 @@ def train_joint(args, classtype, device, trainset, valset, testset, model, fc, p
     混合图走第二次前向（~1.8× 开销同 spread）；对比项/投影头不参与损失；
     训练时 visual.r=args.mm_r，评估（run_val/get_features_test）强制 r=0；
     pacomix 模式：同款混合 CE + PaCoLoss(干净图) 单损失（替代干净图 plain CE），
-    fc 对同一输入只有一种信号（干净图→BS-CE、混合图→plain CE），规避 pacoplus 式双信号病理"""
+    fc 对同一输入只有一种信号（干净图→BS-CE、混合图→plain CE），规避 pacoplus 式双信号病理；
+    transmix 模式（TransMix, Chen et al. CVPR 2022）：rect 掩码（CutMix 框）+ λ̂=混合图前向的
+    CLS 注意力质量占比（TransMix 原版口径）。与 rect 消融臂（mode mergemix --mm_mask rect）
+    单变量对照：唯一差异是 λ̂ 来源（rect 臂=高斯重缩放 Eq.8；本臂=注意力质量占比）；
+    λ̂ detach 无梯度路径（与高斯 λ̂ 同性质，官方 TransMix 的 λ̂ 有梯度路径，此为偏离注明）；
+    掩码固定 rect（--mm_mask 被强制覆盖），--mm_r 0 时即为无 ToMe 的 TransMix 原版形态"""
     criterion = nn.CrossEntropyLoss()
     paco = None
     spread_criterion = None
@@ -393,7 +398,7 @@ def train_joint(args, classtype, device, trainset, valset, testset, model, fc, p
     elif args.mode == 'spread':
         spread_criterion = SpreadLoss(temperature=args.temperature, alpha=args.spread_alpha).to(device)
         supcon_criterion = None
-    elif args.mode == 'mergemix':
+    elif args.mode in ('mergemix', 'transmix'):
         supcon_criterion = None   # 论文纯分类口径：无对比项，proj 不参与损失
     else:
         supcon_criterion = SupConLoss(temperature=args.temperature)
@@ -423,7 +428,7 @@ def train_joint(args, classtype, device, trainset, valset, testset, model, fc, p
                 images, labels = batch
             images = images.to(device)
             labels = labels.to(device)
-            if args.mode in ('mergemix', 'pacomix'):
+            if args.mode in ('mergemix', 'pacomix', 'transmix'):
                 model.visual.r = args.mm_r   # 训练时开 ToMe 合并（评估前关闭）
             if epoch >= args.warmepoch:
                 optimizer.zero_grad()
@@ -441,7 +446,8 @@ def train_joint(args, classtype, device, trainset, valset, testset, model, fc, p
                     k_final = info["source"].shape[-1] if info["source"] is not None else L_seq
                     lam = torch.distributions.Beta(args.mm_alpha, args.mm_alpha)\
                         .sample((images.size(0),)).to(images.device)
-                    mixed, perm, mask_tok = tome_clip.build_mix(images, attn_L, lam)  # Eq.2/7
+                    mixed, perm, mask_tok = tome_clip.build_mix(images, attn_L, lam,
+                                                                mask_mode=args.mm_mask)  # Eq.2/7（attn 或 rect）
                     feat_mix = model.encode_image(mixed).float()   # 混合图第二次前向
                     out_mix = fc(feat_mix)
                     lam_hat = tome_clip.rescale_lambda(k_final, L_seq, mask_tok)       # Eq.8
@@ -461,13 +467,35 @@ def train_joint(args, classtype, device, trainset, valset, testset, model, fc, p
                     k_final = info["source"].shape[-1] if info["source"] is not None else L_seq
                     lam = torch.distributions.Beta(args.mm_alpha, args.mm_alpha)\
                         .sample((images.size(0),)).to(images.device)
-                    mixed, perm, mask_tok = tome_clip.build_mix(images, attn_L, lam)  # Eq.2/7
+                    mixed, perm, mask_tok = tome_clip.build_mix(images, attn_L, lam,
+                                                                mask_mode=args.mm_mask)  # Eq.2/7（attn 或 rect）
                     feat_mix = model.encode_image(mixed).float()   # 混合图第二次前向
                     out_mix = fc(feat_mix)
                     lam_hat = tome_clip.rescale_lambda(k_final, L_seq, mask_tok)       # Eq.8
                     ce_mix = F.cross_entropy(out_mix, labels, reduction='none') * lam_hat \
                         + F.cross_entropy(out_mix, labels[perm], reduction='none') * (1.0 - lam_hat)
                     loss = ce_mix.mean() + supcon_criterion(proj(features), labels, outputs)
+                elif args.mode == 'transmix':
+                    # ---- TransMix（Chen et al., CVPR 2022）：rect 掩码 + 混合图注意力质量 λ̂ ----
+                    # 与 rect 消融臂（mergemix --mm_mask rect, 54.32 on ArtPhoto）单变量对照：
+                    # 唯一差异是 λ̂ 来源。掩码固定 rect（TransMix 本体 = CutMix 框），训练期
+                    # 仍开 ToMe r=mm_r（骨架一致性优先；--mm_r 0 时为无 ToMe 的原版形态）。
+                    # 偏离注明：官方 TransMix 的 λ̂ 有梯度路径，本臂 λ̂ detach（与高斯 λ̂ 同性质）
+                    attn_L = tome_clip.recover_cls_attention(model.visual._tome_info)  # (B, 1+196) 干净图
+                    lam = torch.distributions.Beta(args.mm_alpha, args.mm_alpha)\
+                        .sample((images.size(0),)).to(images.device)
+                    mixed, perm, mask_tok = tome_clip.build_mix(images, attn_L, lam,
+                                                                mask_mode='rect')  # CutMix 框
+                    feat_mix = model.encode_image(mixed).float()   # 混合图第二次前向
+                    out_mix = fc(feat_mix)
+                    # 混合图前向刚结束：_tome_info 现在存的是混合图的注意力快照
+                    attn_mix = tome_clip.recover_cls_attention(model.visual._tome_info)
+                    a_patch = attn_mix[:, 1:].float().detach()     # (B, 196) 无梯度路径
+                    lam_hat = ((a_patch * mask_tok).sum(dim=1)
+                               / (a_patch.sum(dim=1) + 1e-8)).clamp(0.0, 1.0)  # 注意力质量占比
+                    ce_mix = F.cross_entropy(out_mix, labels, reduction='none') * lam_hat \
+                        + F.cross_entropy(out_mix, labels[perm], reduction='none') * (1.0 - lam_hat)
+                    loss = ce_mix.mean() + criterion(outputs, labels)
                 elif args.mode == 'paco':
                     # 官方口径 PaCo 单损失：中心=fc 权重、BS 内嵌，无独立 CE、无 w
                     loss = supcon_criterion(proj(features), labels, outputs)
@@ -495,7 +523,7 @@ def train_joint(args, classtype, device, trainset, valset, testset, model, fc, p
             running_loss += loss.item() * features.size(0)
             running_corrects += torch.sum(preds == labels.data)
 
-        if args.mode in ('mergemix', 'pacomix'):
+        if args.mode in ('mergemix', 'pacomix', 'transmix'):
             model.visual.r = 0   # 评估（run_val / get_features_test）关闭 ToMe 合并，与其他臂同分布可比
 
         epoch_losstrain = running_loss / len(trainset)
@@ -694,14 +722,16 @@ def main():
     parser.add_argument('--modelname', type=str, default='ViT-B/16', help='仅支持 ViT-B/16（fcdim=512）')
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--seed', type=int, default=43)
-    parser.add_argument('--mode', type=str, default='joint', choices=['joint', 'twostage', 'pure', 'genscl', 'paco', 'spread', 'pacoplus', 'mergemix', 'pacomix'],
+    parser.add_argument('--mode', type=str, default='joint', choices=['joint', 'twostage', 'pure', 'genscl', 'paco', 'spread', 'pacoplus', 'mergemix', 'pacomix', 'transmix'],
                         help='joint=CE+w·SupCon 联合单循环；twostage=SupCon 预训练+CE 两阶段；'
                              'pure=纯 SupCon+kNN 评估；genscl=CE+w·GenSCL（Eq.2 复刻，骨架同 joint）；'
                              'paco=官方口径 PaCo 单损失（中心=fc 权重+BS 内嵌，无独立 CE）；'
                              'spread=THANOS L_spread（CE+w·[(1-α)SupCon+α·cNCE]，唯一带增强的臂）；'
                              'pacoplus=CE+w·官方 PaCo（BS 保留，项目本土化混合，官方无此组合）；'
                              'mergemix=MergeMix 论文原版 Eq.9（ToMe 掩码 mixup + λ̂ 重缩放，纯分类损失）；'
-                             'pacomix=mix-CE（只对混合图）+ PaCo 官方单损失（干净图）')
+                             'pacomix=mix-CE（只对混合图）+ PaCo 官方单损失（干净图）；'
+                             'transmix=TransMix（rect 掩码 + λ̂=混合图注意力质量占比，与 mergemix --mm_mask rect '
+                             '单变量对照：唯一差异是 λ̂ 来源）')
     parser.add_argument('--knn_k', type=int, default=20, help='pure 模式 kNN 的邻居数 k')
     parser.add_argument('--num_epochs', type=int, default=25, help='joint/pure 模式总轮数')
     parser.add_argument('--stage1_epochs', type=int, default=25, help='twostage 阶段一（SupCon 预训练）轮数')
@@ -722,6 +752,10 @@ def main():
                              'r=0 即论文 Table 7 的 TopK 消融版；评估时强制 r=0）')
     parser.add_argument('--mm_alpha', type=float, default=1.0,
                         help='mergemix/pacomix 模式 Beta(α,α) 混合比例分布参数（论文 Table 1 口径 α=1.0）')
+    parser.add_argument('--mm_mask', type=str, default='attn', choices=['attn', 'rect'],
+                        help='mergemix/pacomix 混合掩码来源：attn=注意力 TopK 选区（论文原版 Eq.7）；'
+                             'rect=CutMix 式随机矩形（消融对照，单变量检验"注意力选区 vs 随机选区"）；'
+                             'transmix 模式强制 rect（TransMix 本体即 CutMix 框，此参数被覆盖）')
     parser.add_argument('--lr_BB', type=float, default=1e-6)
     parser.add_argument('--lr_FC', type=float, default=1e-3)
     parser.add_argument('--stepsize_BB', type=int, default=6)
@@ -733,6 +767,8 @@ def main():
     args = parser.parse_args()
     if args.datadir and not args.datadir.endswith('/'):
         args.datadir += '/'   # 路径按字符串拼接，结尾斜杠必须补齐
+    if args.mode == 'transmix':
+        args.mm_mask = 'rect'   # TransMix 本体 = CutMix 框；强制覆盖并使 paraminfo 如实记录
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -749,7 +785,7 @@ def main():
 
     model, preprocess = clip.load(args.modelname, device)
     clip.model.convert_weights(model)
-    if args.mode in ('mergemix', 'pacomix'):
+    if args.mode in ('mergemix', 'pacomix', 'transmix'):
         global tome_clip
         import tome_clip
         # OpenAI CLIP 视觉编码器打 ToMe 补丁（原地改 __class__，不复制权重；训练时 r=args.mm_r，
@@ -774,11 +810,11 @@ def main():
     print(starttime)
     startpoint = time.time()
 
-    if args.mode in ('joint', 'genscl', 'paco', 'spread', 'pacoplus', 'mergemix', 'pacomix'):
+    if args.mode in ('joint', 'genscl', 'paco', 'spread', 'pacoplus', 'mergemix', 'pacomix', 'transmix'):
         train_joint(args, classtype, device, trainset, valset, testset, model, fc, proj, log)
         tag = {'joint': 'supconjoint', 'genscl': 'supcongenscl', 'paco': 'supconpaco',
                'spread': 'supconspread', 'pacoplus': 'supconpacoplus', 'mergemix': 'supconmergemix',
-               'pacomix': 'supconpacomix'}[args.mode]
+               'pacomix': 'supconpacomix', 'transmix': 'supcontransmix'}[args.mode]
     elif args.mode == 'twostage':
         train_twostage(args, classtype, device, trainset, valset, testset, model, fc, proj, log)
         tag = 'supcon2stage'
@@ -796,6 +832,7 @@ def main():
                 + ' paco_alpha:' + str(args.paco_alpha) \
                 + ' spread_alpha:' + str(args.spread_alpha) \
                 + ' mm_r:' + str(args.mm_r) + ' mm_alpha:' + str(args.mm_alpha) \
+                + ' mm_mask:' + str(args.mm_mask) \
                 + ' knn_k:' + str(args.knn_k) \
                 + ' lr_FC:' + str(args.lr_FC) + ' stepsize_FC:' + str(args.stepsize_FC) \
                 + ' gamma_FC' + str(args.gamma_FC) + ' lr_BB:' + str(args.lr_BB) \

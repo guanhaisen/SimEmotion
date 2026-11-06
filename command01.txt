@@ -1,0 +1,3 @@
+#α 扫描
+python wise_ft_merge.py 20261102153748 --datadir FI_seed43 --wise_init
+
