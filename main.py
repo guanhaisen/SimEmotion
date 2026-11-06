@@ -47,7 +47,9 @@ def datasetInit(datasetname):
     elif datasetname == 'Twitter1':
         # 2 类（SimEmotion Twitter I：pos 769 / neg 500，1:1.54）；官方 5-fold（config twitter1269，
         # label 0=neg / 1=pos 已由文件夹归属 100% 验证）；折目录 twitter1_fold{i}/{train,test}/{pos,neg}/
-        # 由 prepare_twitter1.py 生成，无 val → 必须配 --no_val（末轮协议）使用
+        # 由 prepare_twitter1.py 生成
+        # **官方协议**（code/SimEmotion-main/main.py L341-344）：非 FI 数据集 val=test——checkpoint 按
+        # test 选择，报告数字即 test 峰值口径；据此 Twitter1 禁用 --no_val（强制 False）
         # classtype ['neg','pos'] 使 neg=0 / pos=1 与官方标签一致；ListMLE 系仅支持 8 类 Mikels，二分类不可用
         _classtype = ['neg', 'pos']
         _data_dir = args.datadir or 'D:/Coding/Python_Projects/SimEmotion/twitter1_fold1/'
@@ -546,7 +548,14 @@ if __name__ == '__main__':
 
     # load the dataset
     trainset = Loaddata('train')
-    valset = None if args.no_val else Loaddata('val')   # --no_val：小数据集 k 折协议，不加载 val
+    if args.datasetname == 'Twitter1':
+        # 官方 SimEmotion 协议（code/SimEmotion-main/main.py L341-344）：非 FI 数据集 val=test，
+        # best-val 选择实际按 test 进行 → FinalTest 恒为 test 峰值口径，与论文直接可比；
+        # 官方无末轮协议，强制禁用 --no_val 以防误用
+        args.no_val = False
+        valset = Loaddata('test')
+    else:
+        valset = None if args.no_val else Loaddata('val')   # --no_val：小数据集 k 折协议，不加载 val
     testset = Loaddata('test')
 
     # load the training setting
