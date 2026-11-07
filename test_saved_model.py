@@ -21,6 +21,9 @@
   # VPT 臂（main.py --loss vpt --vpt_l 32 训练的冻结 ViT + 可学习 prompt token）：
   python test_saved_model.py <ts> --datadir FI_seed43 --vpt --vpt_l 32
 
+  # VPT × PaCo 组合臂（supcon.py --mode vptpaco --vpt_l 32 训练，三件套 supconvptpaco）：
+  python test_saved_model.py <ts> --tag supconvptpaco --vpt --vpt_l 32 --datadir abstract_5fold/fold1
+
 说明:
 - 复用 main.py 的数据/模型定义（Loaddata / FCN / get_features_test / f1_from_matrix），
   保证与训练时的测试逻辑完全一致；
@@ -110,7 +113,8 @@ def main():
     parser.add_argument('--wise_init', action='store_true',
                         help='WiSE-FT 臂（main.py --wise_init 训练）：单层线性头 + 图像特征 L2 归一化，须与训练时一致')
     parser.add_argument('--vpt', action='store_true',
-                        help='VPT 臂（main.py --loss vpt 训练）：冻结 ViT + 可学习 prompt token，须与训练时一致')
+                        help='VPT 系检查点（main.py --loss vpt 或 supcon.py --mode vptpaco --tag supconvptpaco 训练）：'
+                             '冻结 ViT + 可学习 prompt token，须与训练时一致')
     parser.add_argument('--vpt_l', type=int, default=32,
                         help='VPT prompt token 数 L，须与训练时 --vpt_l 一致')
     args = parser.parse_args()
@@ -136,15 +140,17 @@ def main():
     model, preprocess = clip.load("ViT-B/16", device)
     clip.model.convert_weights(model)
     M.preprocess = preprocess
+    if args.vpt:
+        # VPT 系（main.py --loss vpt 或 supcon.py --mode vptpaco）：必须先包装再载入
+        # （state_dict 含 visual.prompt / visual.prompt_pos / visual.vt.* 键）；
+        # 两条 checkpoint 路径共用，包装须在 convert_weights 之后（VPTVisual 约定）
+        model.visual = M.VPTVisual(model.visual, vpt_l=args.vpt_l)
 
     if args.tag is None:
         # ---- main.py 系：model + fc，标准 fc 评估路径 ----
         mpath, fpath = find_main_checkpoint(args.timestamp, args.datasetname)
         print("model 权重:", mpath)
         print("fc 权重   :", fpath)
-        if args.vpt:
-            # VPT 臂：必须先包装再载入（state_dict 含 visual.prompt / visual.prompt_pos / visual.vt.* 键）
-            model.visual = M.VPTVisual(model.visual, vpt_l=args.vpt_l)
         model.load_state_dict(torch.load(mpath, map_location="cpu"))
         model = model.to(device).eval()
         fc_sd = torch.load(fpath, map_location="cpu")

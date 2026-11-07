@@ -381,15 +381,20 @@ def train_joint(args, classtype, device, trainset, valset, testset, model, fc, p
     CLS 注意力质量占比（TransMix 原版口径）。与 rect 消融臂（mode mergemix --mm_mask rect）
     单变量对照：唯一差异是 λ̂ 来源（rect 臂=高斯重缩放 Eq.8；本臂=注意力质量占比）；
     λ̂ detach 无梯度路径（与高斯 λ̂ 同性质，官方 TransMix 的 λ̂ 有梯度路径，此为偏离注明）；
-    掩码固定 rect（--mm_mask 被强制覆盖），--mm_r 0 时即为无 ToMe 的 TransMix 原版形态"""
+    掩码固定 rect（--mm_mask 被强制覆盖），--mm_r 0 时即为无 ToMe 的 TransMix 原版形态；
+    vptpaco 模式（VPT 冻结骨干 × 官方口径 PaCo 单损失，首次正交组合两种形态）：
+    骨干 = main.py VPTVisual（Shallow，--vpt_l 个可学习 prompt token，ViT 全程冻结），损失公式与 paco 逐字相同
+    （中心=fc 权重、BS 内嵌，proj/features/fc 三者均正常参与）；骨干 optimizer/scheduler 不创建，
+    prompt 参数并入 optimizer_fc 与 fc 同组更新（main.py vpt 臂同款），convert_models_to_fp32 全程跳过
+    （冻结参数 grad=None 会崩溃）；warmup 语义：骨干恒冻，warmepoch 仅余日志口径，fc/proj 从 ep0 训练（同 paco）"""
     criterion = nn.CrossEntropyLoss()
     paco = None
     spread_criterion = None
     if args.mode == 'genscl':
         supcon_criterion = GenSCLLoss(temperature=args.temperature)
-    elif args.mode in ('paco', 'pacoplus', 'pacomix'):
+    elif args.mode in ('paco', 'pacoplus', 'pacomix', 'vptpaco'):
         # 类频率 q(y) = n_c/N（与 main.py wce 哨兵臂同口径），Balanced Softmax 内嵌于中心=fc 项
-        # （pacomix 复用同一 PaCoLoss 作为干净图侧的单损失）
+        # （pacomix 复用同一 PaCoLoss 作为干净图侧的单损失；vptpaco 与 paco 逐字共用同一构造路径）
         counts = [sum(1 for _, l in trainset.images if l == c) for c in classtype]
         q = torch.tensor([n / max(sum(counts), 1) for n in counts], dtype=torch.float32)
         paco = PaCoLoss(temperature=args.temperature, alpha=args.paco_alpha,
@@ -402,12 +407,24 @@ def train_joint(args, classtype, device, trainset, valset, testset, model, fc, p
         supcon_criterion = None   # 论文纯分类口径：无对比项，proj 不参与损失
     else:
         supcon_criterion = SupConLoss(temperature=args.temperature)
-    optimizer = torch.optim.AdamW(model.visual.parameters(), lr=args.lr_BB, weight_decay=1e-5)
-    optimizer_fc = torch.optim.Adam(fc.parameters(), lr=args.lr_FC)
-    optimizer_proj = torch.optim.Adam(proj.parameters(), lr=args.lr_FC)
-    scheduler = lr_scheduler.StepLR(optimizer, step_size=args.stepsize_BB, gamma=args.gamma_BB)
-    scheduler_fc = lr_scheduler.StepLR(optimizer_fc, step_size=args.stepsize_FC, gamma=args.gamma_FC)
-    scheduler_proj = lr_scheduler.StepLR(optimizer_proj, step_size=args.stepsize_FC, gamma=args.gamma_FC)
+    if args.mode == 'vptpaco':
+        # VPT：骨干全程冻结，backbone optimizer/scheduler 不创建（main.py vpt 臂同款）；
+        # prompt 参数（requires_grad=True 仅 prompt/prompt_pos）并入 optimizer_fc 与 fc 同组更新，
+        # lr 沿用 lr_FC（prompt 与 fc 头同为轻量新参数，且避免为冻结骨干引入永不步进的 AdamW 状态）
+        prompt_params = [p for p in model.visual.parameters() if p.requires_grad]
+        optimizer_fc = torch.optim.Adam(list(fc.parameters()) + prompt_params, lr=args.lr_FC)
+        optimizer_proj = torch.optim.Adam(proj.parameters(), lr=args.lr_FC)
+        scheduler_fc = lr_scheduler.StepLR(optimizer_fc, step_size=args.stepsize_FC, gamma=args.gamma_FC)
+        scheduler_proj = lr_scheduler.StepLR(optimizer_proj, step_size=args.stepsize_FC, gamma=args.gamma_FC)
+        optimizer = None
+        scheduler = None
+    else:
+        optimizer = torch.optim.AdamW(model.visual.parameters(), lr=args.lr_BB, weight_decay=1e-5)
+        optimizer_fc = torch.optim.Adam(fc.parameters(), lr=args.lr_FC)
+        optimizer_proj = torch.optim.Adam(proj.parameters(), lr=args.lr_FC)
+        scheduler = lr_scheduler.StepLR(optimizer, step_size=args.stepsize_BB, gamma=args.gamma_BB)
+        scheduler_fc = lr_scheduler.StepLR(optimizer_fc, step_size=args.stepsize_FC, gamma=args.gamma_FC)
+        scheduler_proj = lr_scheduler.StepLR(optimizer_proj, step_size=args.stepsize_FC, gamma=args.gamma_FC)
 
     topacc = 0.0
     best_model = copy.deepcopy(model.state_dict())
@@ -430,7 +447,7 @@ def train_joint(args, classtype, device, trainset, valset, testset, model, fc, p
             labels = labels.to(device)
             if args.mode in ('mergemix', 'pacomix', 'transmix'):
                 model.visual.r = args.mm_r   # 训练时开 ToMe 合并（评估前关闭）
-            if epoch >= args.warmepoch:
+            if optimizer is not None and epoch >= args.warmepoch:
                 optimizer.zero_grad()
             optimizer_fc.zero_grad()
             optimizer_proj.zero_grad()
@@ -496,8 +513,9 @@ def train_joint(args, classtype, device, trainset, valset, testset, model, fc, p
                     ce_mix = F.cross_entropy(out_mix, labels, reduction='none') * lam_hat \
                         + F.cross_entropy(out_mix, labels[perm], reduction='none') * (1.0 - lam_hat)
                     loss = ce_mix.mean() + criterion(outputs, labels)
-                elif args.mode == 'paco':
+                elif args.mode in ('paco', 'vptpaco'):
                     # 官方口径 PaCo 单损失：中心=fc 权重、BS 内嵌，无独立 CE、无 w
+                    # （vptpaco 唯一差异在骨干形态：VPT 冻结 ViT + prompt token，损失公式逐字相同）
                     loss = supcon_criterion(proj(features), labels, outputs)
                 elif args.mode == 'pacoplus':
                     # 项目本土化混合：显式 CE + w·官方 PaCo（BS 保留）——分类器双信号（CE 双计属设计）
@@ -514,7 +532,9 @@ def train_joint(args, classtype, device, trainset, valset, testset, model, fc, p
                     loss = ce + args.supcon_weight * sup
                 _, preds = torch.max(outputs, 1)
                 loss.backward()
-                if epoch >= args.warmepoch:
+                if optimizer is not None and epoch >= args.warmepoch:
+                    # vptpaco 全程跳过本分支：冻结骨干无可步进参数，且 convert_models_to_fp32
+                    # 会因冻结参数 grad=None 崩溃（main.py vpt 臂同款守卫）
                     M.convert_models_to_fp32(model.visual)
                     optimizer.step()
                     clip.model.convert_weights(model.visual)
@@ -532,7 +552,7 @@ def train_joint(args, classtype, device, trainset, valset, testset, model, fc, p
         log.append(loginfo + '\n')
         print(loginfo)
 
-        if epoch >= args.warmepoch:
+        if scheduler is not None and epoch >= args.warmepoch:
             scheduler.step()
         scheduler_fc.step()
         scheduler_proj.step()
@@ -722,7 +742,7 @@ def main():
     parser.add_argument('--modelname', type=str, default='ViT-B/16', help='仅支持 ViT-B/16（fcdim=512）')
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--seed', type=int, default=43)
-    parser.add_argument('--mode', type=str, default='joint', choices=['joint', 'twostage', 'pure', 'genscl', 'paco', 'spread', 'pacoplus', 'mergemix', 'pacomix', 'transmix'],
+    parser.add_argument('--mode', type=str, default='joint', choices=['joint', 'twostage', 'pure', 'genscl', 'paco', 'spread', 'pacoplus', 'mergemix', 'pacomix', 'transmix', 'vptpaco'],
                         help='joint=CE+w·SupCon 联合单循环；twostage=SupCon 预训练+CE 两阶段；'
                              'pure=纯 SupCon+kNN 评估；genscl=CE+w·GenSCL（Eq.2 复刻，骨架同 joint）；'
                              'paco=官方口径 PaCo 单损失（中心=fc 权重+BS 内嵌，无独立 CE）；'
@@ -731,7 +751,9 @@ def main():
                              'mergemix=MergeMix 论文原版 Eq.9（ToMe 掩码 mixup + λ̂ 重缩放，纯分类损失）；'
                              'pacomix=mix-CE（只对混合图）+ PaCo 官方单损失（干净图）；'
                              'transmix=TransMix（rect 掩码 + λ̂=混合图注意力质量占比，与 mergemix --mm_mask rect '
-                             '单变量对照：唯一差异是 λ̂ 来源）')
+                             '单变量对照：唯一差异是 λ̂ 来源）；'
+                             'vptpaco=VPT 冻结骨干（--vpt_l 个 prompt token）+ 官方口径 PaCo 单损失'
+                             '（首次正交组合冻结骨干形态 × 对比注入损失）')
     parser.add_argument('--knn_k', type=int, default=20, help='pure 模式 kNN 的邻居数 k')
     parser.add_argument('--num_epochs', type=int, default=25, help='joint/pure 模式总轮数')
     parser.add_argument('--stage1_epochs', type=int, default=25, help='twostage 阶段一（SupCon 预训练）轮数')
@@ -748,7 +770,7 @@ def main():
                         help='spread 模式 cNCE 权重 α：L=(1-α)·L_sup+α·cNCE（官方实验配置 a_lc=a_spread=1 → α=0.5；'
                              '论文理论 spread 区 α>2/3 与官方配置不一致，按官方代码为准；α=0 退化为纯 L_in 版 SupCon）')
     parser.add_argument('--mm_r', type=int, default=8,
-                        help='mergemix/pacomix 模式每层 ToMe 合并 token 数（197 token / 12 层下 r=8 约压缩 48%；'
+                        help='mergemix/pacomix 模式每层 ToMe 合并 token 数（197 token / 12 层下 r=8 约压缩 48%%；'
                              'r=0 即论文 Table 7 的 TopK 消融版；评估时强制 r=0）')
     parser.add_argument('--mm_alpha', type=float, default=1.0,
                         help='mergemix/pacomix 模式 Beta(α,α) 混合比例分布参数（论文 Table 1 口径 α=1.0）')
@@ -763,6 +785,9 @@ def main():
     parser.add_argument('--stepsize_FC', type=int, default=6)
     parser.add_argument('--gamma_FC', type=float, default=0.5)
     parser.add_argument('--warmepoch', type=int, default=3, help='joint 模式 warmup 轮数（backbone 冻结）')
+    parser.add_argument('--vpt_l', type=int, default=32,
+                        help='vptpaco 模式的 prompt token 数 L（与 main.py --loss vpt 同量级，默认 32）；'
+                             '测试脚本需 --tag supconvptpaco --vpt --vpt_l <L>')
     parser.add_argument('--datadir', type=str, default=None, help='数据划分目录（如 FI_seed43），结尾斜杠可省略')
     args = parser.parse_args()
     if args.datadir and not args.datadir.endswith('/'):
@@ -785,6 +810,10 @@ def main():
 
     model, preprocess = clip.load(args.modelname, device)
     clip.model.convert_weights(model)
+    if args.mode == 'vptpaco':
+        # VPT 包装必须在 convert_weights 之后（VPTVisual 约定：prompt 参数保持 fp32，前向 .to(x.dtype) 对齐 fp16 主干）；
+        # vt 参数全部冻结，仅 prompt/prompt_pos 可训练（main.py VPTVisual 同款，经 import 注入复用）
+        model.visual = M.VPTVisual(model.visual, vpt_l=args.vpt_l).to(device)
     if args.mode in ('mergemix', 'pacomix', 'transmix'):
         global tome_clip
         import tome_clip
@@ -813,11 +842,11 @@ def main():
     print(starttime)
     startpoint = time.time()
 
-    if args.mode in ('joint', 'genscl', 'paco', 'spread', 'pacoplus', 'mergemix', 'pacomix', 'transmix'):
+    if args.mode in ('joint', 'genscl', 'paco', 'spread', 'pacoplus', 'mergemix', 'pacomix', 'transmix', 'vptpaco'):
         train_joint(args, classtype, device, trainset, valset, testset, model, fc, proj, log)
         tag = {'joint': 'supconjoint', 'genscl': 'supcongenscl', 'paco': 'supconpaco',
                'spread': 'supconspread', 'pacoplus': 'supconpacoplus', 'mergemix': 'supconmergemix',
-               'pacomix': 'supconpacomix', 'transmix': 'supcontransmix'}[args.mode]
+               'pacomix': 'supconpacomix', 'transmix': 'supcontransmix', 'vptpaco': 'supconvptpaco'}[args.mode]
     elif args.mode == 'twostage':
         train_twostage(args, classtype, device, trainset, valset, testset, model, fc, proj, log)
         tag = 'supcon2stage'
@@ -840,7 +869,9 @@ def main():
                 + ' lr_FC:' + str(args.lr_FC) + ' stepsize_FC:' + str(args.stepsize_FC) \
                 + ' gamma_FC' + str(args.gamma_FC) + ' lr_BB:' + str(args.lr_BB) \
                 + ' stepsize_BB:' + str(args.stepsize_BB) + ' gamma_BB' + str(args.gamma_BB) \
-                + ' warmepoch:' + str(args.warmepoch) + ' seed:' + str(args.seed) \
+                + ' warmepoch:' + str(args.warmepoch) \
+                + (' vpt_l:' + str(args.vpt_l) if args.mode == 'vptpaco' else '') \
+                + ' seed:' + str(args.seed) \
                 + ' datadir:' + str(args.datadir)
     print(paraminfo)
     log.append(paraminfo + '\n')
