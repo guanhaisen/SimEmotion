@@ -21,8 +21,9 @@
   # VPT 臂（main.py --loss vpt --vpt_l 32 训练的冻结 ViT + 可学习 prompt token）：
   python test_saved_model.py <ts> --datadir FI_seed43 --vpt --vpt_l 32
 
-  # VPT × PaCo 组合臂（supcon.py --mode vptpaco --vpt_l 32 训练，三件套 supconvptpaco）：
+  # VPT × PaCo 组合臂（supcon.py --mode vptpaco / vptpacoplus --vpt_l 32 训练，三件套 supconvptpaco / supconvptpacoplus）：
   python test_saved_model.py <ts> --tag supconvptpaco --vpt --vpt_l 32 --datadir abstract_5fold/fold1
+  python test_saved_model.py <ts> --tag supconvptpacoplus --vpt --vpt_l 32 --datadir abstract_5fold/fold1
 
 说明:
 - 复用 main.py 的数据/模型定义（Loaddata / FCN / get_features_test / f1_from_matrix），
@@ -113,8 +114,8 @@ def main():
     parser.add_argument('--wise_init', action='store_true',
                         help='WiSE-FT 臂（main.py --wise_init 训练）：单层线性头 + 图像特征 L2 归一化，须与训练时一致')
     parser.add_argument('--vpt', action='store_true',
-                        help='VPT 系检查点（main.py --loss vpt 或 supcon.py --mode vptpaco --tag supconvptpaco 训练）：'
-                             '冻结 ViT + 可学习 prompt token，须与训练时一致')
+                        help='VPT 系检查点（main.py --loss vpt 或 supcon.py --mode vptpaco/vptpacoplus '
+                             '--tag supconvptpaco/supconvptpacoplus 训练）：冻结 ViT + 可学习 prompt token，须与训练时一致')
     parser.add_argument('--vpt_l', type=int, default=32,
                         help='VPT prompt token 数 L，须与训练时 --vpt_l 一致')
     args = parser.parse_args()

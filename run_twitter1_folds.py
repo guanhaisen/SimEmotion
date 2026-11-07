@@ -37,7 +37,7 @@ DIR_TPL = {'Twitter1': 'twitter1_fold{i}', 'Abstract7': 'abstract_5fold/fold{i}'
 GLOB_PAT = {'Twitter1': 'ViT-B-16_Twitter1*.txt', 'Abstract7': 'ViT-B-16_Abstract7*.txt'}
 # --loss 传这些名字时改走 supcon.py 后端（--mode 同名），日志 tag = supcon{mode}
 SUPCON_MODES = {'joint', 'twostage', 'pure', 'genscl', 'paco', 'spread', 'pacoplus',
-                'mergemix', 'pacomix', 'transmix', 'vptpaco'}
+                'mergemix', 'pacomix', 'transmix', 'vptpaco', 'vptpacoplus'}
 assert DATASET in DIR_TPL, f'未知数据集 {DATASET}（支持: {list(DIR_TPL)}）'
 TAG = DATASET.lower()
 GLOB = (f'supcon{LOSS}_{DATASET}*.txt') if LOSS in SUPCON_MODES else GLOB_PAT[DATASET]
@@ -49,7 +49,7 @@ if LOSS in SUPCON_MODES:
     BASE_CMD = [PY, 'supcon.py', '--datasetname', DATASET, '--mode', LOSS,
                 '--modelname', 'ViT-B/16', '--batch_size', '32',
                 '--num_epochs', '25', '--seed', '43']
-    if LOSS == 'vptpaco':
+    if LOSS in ('vptpaco', 'vptpacoplus'):
         BASE_CMD += ['--vpt_l', '32']
 else:
     BASE_CMD = [PY, 'main.py', '--datasetname', DATASET, '--loss', LOSS,
