@@ -44,6 +44,13 @@ def datasetInit(datasetname):
         #   test 56 张，噪声带 ±5-6pp，结论定性为主并需同时报 test peak）
         _classtype = ['amusement', 'anger', 'awe', 'contentment', 'disgust', 'excitement', 'fear', 'sadness']
         _data_dir = args.datadir or 'D:/Coding/Python_Projects/SimEmotion/abstract_split/'
+    elif datasetname == 'Abstract7':
+        # 官方 abstract_partition 5-fold（226 张，7 类无 anger——官方划分本身不含 anger）；
+        # abstract_5fold/fold{i}/{train,test}/<7 类>/ 已 100% 校验与 config 一致（2026-11-07）
+        # 注意类名是 'sad'（非 sadness）；每折无 val → 必须配 --no_val；与 Abstract（280 张 8 类）不同协议与标签空间，不可混排
+        # MASP 可比协议（其 Abstract 数字疑为此 226/7 类口径，见论文数据集清单.md 备注）
+        _classtype = ['amusement', 'awe', 'contentment', 'disgust', 'excitement', 'fear', 'sad']
+        _data_dir = args.datadir or 'D:/Coding/Python_Projects/SimEmotion/abstract_5fold/fold1/'
     elif datasetname == 'Twitter1':
         # 2 类（SimEmotion Twitter I：pos 769 / neg 500，1:1.54）；官方 5-fold（config twitter1269，
         # label 0=neg / 1=pos 已由文件夹归属 100% 验证）；折目录 twitter1_fold{i}/{train,test}/{pos,neg}/
@@ -548,10 +555,10 @@ if __name__ == '__main__':
 
     # load the dataset
     trainset = Loaddata('train')
-    if args.datasetname == 'Twitter1':
-        # 官方 SimEmotion 协议（code/SimEmotion-main/main.py L341-344）：非 FI 数据集 val=test，
-        # best-val 选择实际按 test 进行 → FinalTest 恒为 test 峰值口径，与论文直接可比；
-        # 官方无末轮协议，强制禁用 --no_val 以防误用
+    if args.datasetname in ('Twitter1', 'Abstract7'):
+        # 官方协议（SimEmotion code L341-344 对非 FI 数据集一律 val=test）：checkpoint 按 test 选择
+        # → FinalTest 恒为 test 峰值口径，与论文直接可比；官方无末轮协议，强制禁用 --no_val 以防误用
+        # Abstract7（官方 abstract_partition 5-fold）同样按此口径（与 Twitter1 同款）
         args.no_val = False
         valset = Loaddata('test')
     else:

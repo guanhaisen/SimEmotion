@@ -799,7 +799,10 @@ def main():
     args.modelname = args.modelname.replace('/', '-')
 
     trainset = M.Loaddata('train')
-    valset = M.Loaddata('val')
+    if args.datasetname in ('Twitter1', 'Abstract7'):
+        valset = M.Loaddata('test')   # 官方 val=test 协议（fold 目录无 val/，与 main.py L558 同款）
+    else:
+        valset = M.Loaddata('val')
     testset = M.Loaddata('test')
 
     print("New SupCon experiment start.")
