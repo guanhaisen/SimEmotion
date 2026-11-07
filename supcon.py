@@ -341,7 +341,7 @@ def run_val(model, fc, criterion, valdataset, batch_size, device):
         for images, labels in tqdm(DataLoader(valdataset, batch_size=batch_size, shuffle=False)):
             images = images.to(device)
             labels = labels.to(device)
-            features = model.encode_image(images).float()
+            features = M.encode_features(images)
             outputs = fc(features)
             loss = criterion(outputs, labels)
             _, preds = torch.max(outputs, 1)
@@ -397,7 +397,10 @@ def train_joint(args, classtype, device, trainset, valset, testset, model, fc, p
     vptpacoplusmix 模式：vptpacoplus 甜点配置（w=0.25）之上的 mixup 叠加单变量对照——
     L = CE（干净图）+ w·官方 PaCo（干净图）+ rect-mix-CE（混合图，原始 λ）；与 vptpacoplus 唯一差异 = +mix-CE，
     直接回答"增广在最优配置之上还有没有增量"（FI 全量微调上 pacomix 对 paco 为 −0.98，冻结端未测）；
-    掩码/λ/r=0/零 ToMe 口径同 vptpacomix；干净图双信号（CE + w·PaCo）在冻结形态下已证非病理（vptpacoplus 臂）"""
+    掩码/λ/r=0/零 ToMe 口径同 vptpacomix；干净图双信号（CE + w·PaCo）在冻结形态下已证非病理（vptpacoplus 臂）；
+    vptspread 模式：vptpaco 冻结接线 × spread 原公式——增广只喂对比项（L_sup 自身对 + cNCE），CE 输入恒干净，
+    与 --aug（抖动打在 CE 输入，冻结甜点上净负）是不同通路；双视图 AugPairDataset 照常生效，
+    检验"双视图对比一致性"在冻结骨干上是否有 --aug 所没有的增益"""
     criterion = nn.CrossEntropyLoss()
     paco = None
     spread_criterion = None
@@ -412,14 +415,14 @@ def train_joint(args, classtype, device, trainset, valset, testset, model, fc, p
         paco = PaCoLoss(temperature=args.temperature, alpha=args.paco_alpha,
                         num_classes=len(classtype), q=q).to(device)
         supcon_criterion = paco
-    elif args.mode == 'spread':
+    elif args.mode in ('spread', 'vptspread'):
         spread_criterion = SpreadLoss(temperature=args.temperature, alpha=args.spread_alpha).to(device)
         supcon_criterion = None
     elif args.mode in ('mergemix', 'transmix'):
         supcon_criterion = None   # 论文纯分类口径：无对比项，proj 不参与损失
     else:
         supcon_criterion = SupConLoss(temperature=args.temperature)
-    if args.mode in ('vptpaco', 'vptpacoplus', 'vptpacomix', 'vptpacoplusmix'):
+    if args.mode in ('vptpaco', 'vptpacoplus', 'vptpacomix', 'vptpacoplusmix', 'vptspread'):
         # VPT：骨干全程冻结，backbone optimizer/scheduler 不创建（main.py vpt 臂同款）；
         # prompt 参数（requires_grad=True 仅 prompt/prompt_pos）并入 optimizer_fc 与 fc 同组更新，
         # lr 沿用 lr_FC（prompt 与 fc 头同为轻量新参数，且避免为冻结骨干引入永不步进的 AdamW 状态）
@@ -444,13 +447,13 @@ def train_joint(args, classtype, device, trainset, valset, testset, model, fc, p
     best_proj = copy.deepcopy(proj.state_dict())
 
     # spread 模式用双视图数据集（原图 + 增强图），其余臂用原训练集
-    loader_src = AugPairDataset(trainset) if args.mode == 'spread' else trainset
+    loader_src = AugPairDataset(trainset) if args.mode in ('spread', 'vptspread') else trainset
 
     for epoch in range(args.num_epochs):
         running_loss = 0.0
         running_corrects = 0
         for batch in tqdm(DataLoader(loader_src, batch_size=args.batch_size, shuffle=True)):
-            if args.mode == 'spread':
+            if args.mode in ('spread', 'vptspread'):
                 images, images_aug, labels = batch
                 images_aug = images_aug.to(device)
             else:
@@ -464,7 +467,7 @@ def train_joint(args, classtype, device, trainset, valset, testset, model, fc, p
             optimizer_fc.zero_grad()
             optimizer_proj.zero_grad()
             with torch.set_grad_enabled(True):
-                features = model.encode_image(images).float()
+                features = M.encode_features(images)
                 outputs = fc(features)
                 if args.mode == 'mergemix':
                     # ---- MergeMix 论文 Eq.9：ToMe 掩码 mixup + λ̂ 重缩放（纯分类损失）----
@@ -477,7 +480,7 @@ def train_joint(args, classtype, device, trainset, valset, testset, model, fc, p
                         .sample((images.size(0),)).to(images.device)
                     mixed, perm, mask_tok = tome_clip.build_mix(images, attn_L, lam,
                                                                 mask_mode=args.mm_mask)  # Eq.2/7（attn 或 rect）
-                    feat_mix = model.encode_image(mixed).float()   # 混合图第二次前向
+                    feat_mix = M.encode_features(mixed)   # 混合图第二次前向
                     out_mix = fc(feat_mix)
                     lam_hat = tome_clip.rescale_lambda(k_final, L_seq, mask_tok)       # Eq.8
                     # Eq.9：λ̂ 加权混合 CE（逐样本 reduction='none'）+ 干净图标准 CE
@@ -498,7 +501,7 @@ def train_joint(args, classtype, device, trainset, valset, testset, model, fc, p
                         .sample((images.size(0),)).to(images.device)
                     mixed, perm, mask_tok = tome_clip.build_mix(images, attn_L, lam,
                                                                 mask_mode=args.mm_mask)  # Eq.2/7（attn 或 rect）
-                    feat_mix = model.encode_image(mixed).float()   # 混合图第二次前向
+                    feat_mix = M.encode_features(mixed)   # 混合图第二次前向
                     out_mix = fc(feat_mix)
                     lam_hat = tome_clip.rescale_lambda(k_final, L_seq, mask_tok)       # Eq.8
                     ce_mix = F.cross_entropy(out_mix, labels, reduction='none') * lam_hat \
@@ -513,7 +516,7 @@ def train_joint(args, classtype, device, trainset, valset, testset, model, fc, p
                     lam = torch.distributions.Beta(args.mm_alpha, args.mm_alpha)\
                         .sample((images.size(0),)).to(images.device)
                     mixed, perm, mask_tok = tome_clip.build_mix(images, None, lam, mask_mode='rect')
-                    feat_mix = model.encode_image(mixed).float()   # 混合图第二次前向
+                    feat_mix = M.encode_features(mixed)   # 混合图第二次前向
                     out_mix = fc(feat_mix)
                     ce_mix = F.cross_entropy(out_mix, labels, reduction='none') * lam \
                         + F.cross_entropy(out_mix, labels[perm], reduction='none') * (1.0 - lam)
@@ -526,7 +529,7 @@ def train_joint(args, classtype, device, trainset, valset, testset, model, fc, p
                     lam = torch.distributions.Beta(args.mm_alpha, args.mm_alpha)\
                         .sample((images.size(0),)).to(images.device)
                     mixed, perm, mask_tok = tome_clip.build_mix(images, None, lam, mask_mode='rect')
-                    feat_mix = model.encode_image(mixed).float()   # 混合图第二次前向
+                    feat_mix = M.encode_features(mixed)   # 混合图第二次前向
                     out_mix = fc(feat_mix)
                     ce_mix = F.cross_entropy(out_mix, labels, reduction='none') * lam \
                         + F.cross_entropy(out_mix, labels[perm], reduction='none') * (1.0 - lam)
@@ -543,7 +546,7 @@ def train_joint(args, classtype, device, trainset, valset, testset, model, fc, p
                         .sample((images.size(0),)).to(images.device)
                     mixed, perm, mask_tok = tome_clip.build_mix(images, attn_L, lam,
                                                                 mask_mode='rect')  # CutMix 框
-                    feat_mix = model.encode_image(mixed).float()   # 混合图第二次前向
+                    feat_mix = M.encode_features(mixed)   # 混合图第二次前向
                     out_mix = fc(feat_mix)
                     # 混合图前向刚结束：_tome_info 现在存的是混合图的注意力快照
                     attn_mix = tome_clip.recover_cls_attention(model.visual._tome_info)
@@ -562,9 +565,10 @@ def train_joint(args, classtype, device, trainset, valset, testset, model, fc, p
                     # vptpacoplus 唯一差异在骨干形态（VPT 冻结 ViT + prompt token），损失公式逐字相同
                     loss = criterion(outputs, labels) \
                         + args.supcon_weight * supcon_criterion(proj(features), labels, outputs)
-                elif args.mode == 'spread':
+                elif args.mode in ('spread', 'vptspread'):
                     # THANOS L_spread 官方口径：增强图进对比项（L_sup 自身对 + cNCE 正例），CE 头只看原图
-                    features_aug = model.encode_image(images_aug).float()
+                    # （vptspread 唯一差异在骨干形态：增广只喂对比项、CE 输入恒干净，与 --aug 通路不同）
+                    features_aug = M.encode_features(images_aug)
                     spread = spread_criterion(proj(features), labels, proj(features_aug))
                     loss = criterion(outputs, labels) + args.supcon_weight * spread
                 else:
@@ -657,7 +661,7 @@ def train_twostage(args, classtype, device, trainset, valset, testset, model, fc
                 optimizer.zero_grad()
                 optimizer_proj.zero_grad()
                 with torch.set_grad_enabled(True):
-                    features = model.encode_image(images).float()
+                    features = M.encode_features(images)
                     loss = supcon_criterion(proj(features), labels)
                     loss.backward()
                     M.convert_models_to_fp32(model.visual)
@@ -689,7 +693,7 @@ def train_twostage(args, classtype, device, trainset, valset, testset, model, fc
             optimizer_fc.zero_grad()
             with torch.set_grad_enabled(True):
                 with torch.no_grad():                      # backbone 冻结：编码不建图
-                    features = model.encode_image(images).float()
+                    features = M.encode_features(images)
                 outputs = fc(features)
                 loss = criterion(outputs, labels)
                 _, preds = torch.max(outputs, 1)
@@ -742,7 +746,7 @@ def train_pure(args, classtype, device, trainset, valset, testset, model, proj, 
             optimizer.zero_grad()
             optimizer_proj.zero_grad()
             with torch.set_grad_enabled(True):
-                features = model.encode_image(images).float()
+                features = M.encode_features(images)
                 loss = supcon_criterion(proj(features), labels)
                 loss.backward()
                 M.convert_models_to_fp32(model.visual)
@@ -783,7 +787,7 @@ def main():
     parser.add_argument('--modelname', type=str, default='ViT-B/16', help='仅支持 ViT-B/16（fcdim=512）')
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--seed', type=int, default=43)
-    parser.add_argument('--mode', type=str, default='joint', choices=['joint', 'twostage', 'pure', 'genscl', 'paco', 'spread', 'pacoplus', 'mergemix', 'pacomix', 'transmix', 'vptpaco', 'vptpacoplus', 'vptpacomix', 'vptpacoplusmix'],
+    parser.add_argument('--mode', type=str, default='joint', choices=['joint', 'twostage', 'pure', 'genscl', 'paco', 'spread', 'pacoplus', 'mergemix', 'pacomix', 'transmix', 'vptpaco', 'vptpacoplus', 'vptpacomix', 'vptpacoplusmix', 'vptspread'],
                         help='joint=CE+w·SupCon 联合单循环；twostage=SupCon 预训练+CE 两阶段；'
                              'pure=纯 SupCon+kNN 评估；genscl=CE+w·GenSCL（Eq.2 复刻，骨架同 joint）；'
                              'paco=官方口径 PaCo 单损失（中心=fc 权重+BS 内嵌，无独立 CE）；'
@@ -799,7 +803,9 @@ def main():
                              'vptpacomix=VPT 冻结骨干 + rect-mix-CE（混合图）+ PaCo 单损失（干净图，pacomix 的冻结版，'
                              '强制 --mm_mask rect --mm_r 0，原始 λ 无 Eq.8 重缩放）；'
                              'vptpacoplusmix=VPT 冻结骨干 + CE（干净图）+ w·官方 PaCo（干净图）+ rect-mix-CE（混合图）'
-                             '（vptpacoplus 甜点配置之上的 mixup 叠加单变量对照，强制 --mm_mask rect --mm_r 0）')
+                             '（vptpacoplus 甜点配置之上的 mixup 叠加单变量对照，强制 --mm_mask rect --mm_r 0）；'
+                             'vptspread=VPT 冻结骨干 + THANOS L_spread（CE 干净图 + w·[(1-α)L_sup+α·cNCE] 增强视图'
+                             '对比一致性——增广只喂对比项不碰 CE 输入，与 --aug 的负结果通路不同）')
     parser.add_argument('--knn_k', type=int, default=20, help='pure 模式 kNN 的邻居数 k')
     parser.add_argument('--num_epochs', type=int, default=25, help='joint/pure 模式总轮数')
     parser.add_argument('--stage1_epochs', type=int, default=25, help='twostage 阶段一（SupCon 预训练）轮数')
@@ -832,8 +838,18 @@ def main():
     parser.add_argument('--gamma_FC', type=float, default=0.5)
     parser.add_argument('--warmepoch', type=int, default=3, help='joint 模式 warmup 轮数（backbone 冻结）')
     parser.add_argument('--vpt_l', type=int, default=32,
-                        help='vptpaco/vptpacoplus 模式的 prompt token 数 L（与 main.py --loss vpt 同量级，默认 32）；'
-                             '测试脚本需 --tag supconvptpaco / supconvptpacoplus --vpt --vpt_l <L>')
+                        help='vptpaco/vptpacoplus/vptpacomix/vptpacoplusmix 模式的 prompt token 数 L（与 main.py --loss vpt 同量级，默认 32）；'
+                             '测试脚本需 --tag supconvptpaco / supconvptpacoplus / supconvptpacomix / supconvptpacoplusmix --vpt --vpt_l <L>')
+    parser.add_argument('--wise_init', action='store_true',
+                        help='WiSE-FT 零样本初始化（论文 D.2）：fc 改为单层线性头并用 CLIP 文本原型初始化'
+                             '（每类 8 模板平均、L2 归一化、×logit_scale），训练/评估全程 L2 归一化图像特征；'
+                             '与 --mode vptpacoplus 组合 = 文本锚定的 PaCo 参数中心（中心=fc 权重=文本原型）；'
+                             '架构混杂（MLP→线性头）与 wiseft 臂同款；测试脚本需 --wise_init --vpt --vpt_l <L>')
+    parser.add_argument('--aug', action='store_true',
+                        help='WiSE-FT 官方训练增强（论文 D.2）：仅训练集走 RandomResizedCrop(0.9-1.0, BICUBIC)'
+                             '+ CLIP Normalize 管线，val/test 保持确定性 eval preprocess；'
+                             '与 mixup 家族不同家族的几何增广（mixup 线已关闭不覆盖本 flag）；'
+                             '实现复用 main.py Loaddata 的 train_preprocess 注入机制')
     parser.add_argument('--datadir', type=str, default=None, help='数据划分目录（如 FI_seed43），结尾斜杠可省略')
     args = parser.parse_args()
     if args.datadir and not args.datadir.endswith('/'):
@@ -851,7 +867,8 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # ---- 注入 main 模块全局量（顺序关键：args 先于 datasetInit）----
-    M.args = types.SimpleNamespace(datasetname=args.datasetname, batch_size=args.batch_size, datadir=args.datadir)
+    M.args = types.SimpleNamespace(datasetname=args.datasetname, batch_size=args.batch_size, datadir=args.datadir,
+                                   wise_init=args.wise_init, aug=args.aug)
     classtype, data_dir = M.datasetInit(args.datasetname)
     M.classtype = classtype
     M.data_dir = data_dir
@@ -863,7 +880,7 @@ def main():
 
     model, preprocess = clip.load(args.modelname, device)
     clip.model.convert_weights(model)
-    if args.mode in ('vptpaco', 'vptpacoplus', 'vptpacomix', 'vptpacoplusmix'):
+    if args.mode in ('vptpaco', 'vptpacoplus', 'vptpacomix', 'vptpacoplusmix', 'vptspread'):
         # VPT 包装必须在 convert_weights 之后（VPTVisual 约定：prompt 参数保持 fp32，前向 .to(x.dtype) 对齐 fp16 主干）；
         # vt 参数全部冻结，仅 prompt/prompt_pos 可训练（main.py VPTVisual 同款，经 import 注入复用）
         model.visual = M.VPTVisual(model.visual, vpt_l=args.vpt_l).to(device)
@@ -877,7 +894,26 @@ def main():
             # 且冻结骨干训练期合并无意义（见 parse 处注释）→ 完全不打补丁，模型保持原始前向
             tome_clip.apply_patch(model.visual, r=args.mm_r, trace_source=True)
     M.preprocess = preprocess
-    fc = M.FCN(dim=512).to(device)
+    # --aug 训练增强（main.py wise-ft 官方管线逐字复刻）：仅训练集走 RRC 管线，
+    # 经 M.Loaddata 的 globals().get('train_preprocess') 注入机制生效（main.py L104-107）；
+    # VPTVisual 的 input_resolution 透传属性保证 n_px 获取一致
+    M.train_preprocess = None
+    if args.aug:
+        n_px = model.visual.input_resolution          # ViT-B/16 = 224（VPT 包装后仍可透传）
+        M.train_preprocess = M.Compose([
+            M.RandomResizedCrop(n_px, scale=(0.9, 1.0), interpolation=M.Image.BICUBIC),
+            M._to_rgb,
+            M.ToTensor(),
+            M.Normalize((0.48145466, 0.4578275, 0.40821073),
+                        (0.26862954, 0.26130258, 0.27577711)),
+        ])
+    if args.wise_init:
+        # WiSE-FT 零样本初始化（main.py build_zero_shot_head 复用）：单层线性头，权重 = 文本类原型
+        # （每类 8 模板平均嵌入、L2 归一化、×logit_scale，bias=0）。PaCo 中心=fc 权重 → 中心被文本锚定；
+        # 注意架构混杂（MLP→线性头）与 wiseft 臂同款。须在 M.classtype 设置之后调用（内部读全局 classtype）
+        fc = M.build_zero_shot_head(model, device, 512)
+    else:
+        fc = M.FCN(dim=512).to(device)
     proj = SupConProjector(dim=512).to(device)
     M.model = model
     M.fc = fc
@@ -898,13 +934,13 @@ def main():
     print(starttime)
     startpoint = time.time()
 
-    if args.mode in ('joint', 'genscl', 'paco', 'spread', 'pacoplus', 'mergemix', 'pacomix', 'transmix', 'vptpaco', 'vptpacoplus', 'vptpacomix', 'vptpacoplusmix'):
+    if args.mode in ('joint', 'genscl', 'paco', 'spread', 'pacoplus', 'mergemix', 'pacomix', 'transmix', 'vptpaco', 'vptpacoplus', 'vptpacomix', 'vptpacoplusmix', 'vptspread'):
         train_joint(args, classtype, device, trainset, valset, testset, model, fc, proj, log)
         tag = {'joint': 'supconjoint', 'genscl': 'supcongenscl', 'paco': 'supconpaco',
                'spread': 'supconspread', 'pacoplus': 'supconpacoplus', 'mergemix': 'supconmergemix',
                'pacomix': 'supconpacomix', 'transmix': 'supcontransmix', 'vptpaco': 'supconvptpaco',
                'vptpacoplus': 'supconvptpacoplus', 'vptpacomix': 'supconvptpacomix',
-               'vptpacoplusmix': 'supconvptpacoplusmix'}[args.mode]
+               'vptpacoplusmix': 'supconvptpacoplusmix', 'vptspread': 'supconvptspread'}[args.mode]
     elif args.mode == 'twostage':
         train_twostage(args, classtype, device, trainset, valset, testset, model, fc, proj, log)
         tag = 'supcon2stage'
@@ -928,7 +964,9 @@ def main():
                 + ' gamma_FC' + str(args.gamma_FC) + ' lr_BB:' + str(args.lr_BB) \
                 + ' stepsize_BB:' + str(args.stepsize_BB) + ' gamma_BB' + str(args.gamma_BB) \
                 + ' warmepoch:' + str(args.warmepoch) \
-                + (' vpt_l:' + str(args.vpt_l) if args.mode in ('vptpaco', 'vptpacoplus', 'vptpacomix', 'vptpacoplusmix') else '') \
+                + (' vpt_l:' + str(args.vpt_l) if args.mode in ('vptpaco', 'vptpacoplus', 'vptpacomix', 'vptpacoplusmix', 'vptspread') else '') \
+                + (' wise_init:True' if args.wise_init else '') \
+                + (' aug:True' if args.aug else '') \
                 + ' seed:' + str(args.seed) \
                 + ' datadir:' + str(args.datadir)
     print(paraminfo)

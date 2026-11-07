@@ -28,6 +28,10 @@
   python test_saved_model.py <ts> --tag supconvptpacomix --vpt --vpt_l 32 --datadir abstract_5fold/fold1
   python test_saved_model.py <ts> --tag supconvptpacoplusmix --vpt --vpt_l 32 --datadir abstract_5fold/fold1
 
+  # VPT × PaCo × zinit 组合臂（supcon.py --mode vptpacoplus --wise_init --supcon_weight 0.25 训练，
+  # 单层线性头自动识别 + 特征 L2 归一化）：
+  python test_saved_model.py <ts> --tag supconvptpacoplus --vpt --vpt_l 32 --wise_init --datadir abstract_5fold/fold1
+
 说明:
 - 复用 main.py 的数据/模型定义（Loaddata / FCN / get_features_test / f1_from_matrix），
   保证与训练时的测试逻辑完全一致；
@@ -115,11 +119,13 @@ def main():
                              'supconspread/supconpacoplus/supcon2stage）；缺省走 main.py 系权重')
     parser.add_argument('--knn_k', type=int, default=20, help='pure 两件套的 kNN 邻居数')
     parser.add_argument('--wise_init', action='store_true',
-                        help='WiSE-FT 臂（main.py --wise_init 训练）：单层线性头 + 图像特征 L2 归一化，须与训练时一致')
+                        help='WiSE-FT 零样本初始化臂（main.py --wise_init 或 supcon.py --wise_init 训练）：'
+                             '单层线性头 + 图像特征 L2 归一化，须与训练时一致')
     parser.add_argument('--vpt', action='store_true',
                         help='VPT 系检查点（main.py --loss vpt 或 supcon.py --mode vptpaco/vptpacoplus/vptpacomix/'
                              'vptpacoplusmix --tag supconvptpaco/supconvptpacoplus/supconvptpacomix/'
-                             'supconvptpacoplusmix 训练）：冻结 ViT + 可学习 prompt token，须与训练时一致')
+                             'supconvptpacoplusmix 训练）：冻结 ViT + 可学习 prompt token，须与训练时一致；'
+                             'zinit 组合臂另需 --wise_init')
     parser.add_argument('--vpt_l', type=int, default=32,
                         help='VPT prompt token 数 L，须与训练时 --vpt_l 一致')
     args = parser.parse_args()
