@@ -72,12 +72,14 @@ import os
 import time
 import types
 
+import numpy as np
+
 import clip
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import lr_scheduler
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, TensorDataset
 from torchvision import transforms
 from PIL import Image
 from tqdm import tqdm
@@ -113,21 +115,30 @@ class GenSCLLoss(nn.Module):
     """广义监督对比损失（GenSCL, Kim et al. arXiv:2206.00384 Eq.2）忠实复刻：
     L_gen = -1/|A(i)| Σ_{i∈I} Σ_{j∈A(i)} sim(y_i,y_j) · log( exp(z_i·z_j/τ) / Σ_{a∈A(i)} exp(z_i·z_a/τ) )
     sim(y_i,y_j) = 标签向量的余弦相似度：one-hot 下退化为同类的 0/1 指示阵，
-    混合标签（CutMix/KD 软目标）下自动推广为 [0,1] 连续权重（本模式当前只用 one-hot）
+    混合标签（CutMix/KD 软目标）下自动推广为 [0,1] 连续权重（genscl 用 one-hot，genscl2stage 用软标签）
     与 SupConLoss 的两点数学差异（复刻对照臂的意义所在）:
       1) 逐 anchor 归一化用 1/|A(i)|（B-1，全部对比样本）而非 1/|P(i)|（正样本数）
       2) 无 valid 掩码——无同类正样本的 anchor 贡献 0 损失行，仍计入均值（与论文公式一致）
     量级提示：one-hot 下 L_gen ≈ SupCon × |P(i)|/(B-1)（batch 32、每类约 4 正样本时约 0.1 倍），
     同 w=0.5 时对比项的实际强度远小于 joint 臂——臂间对比时必须注明，或按量级折算 w
-    输入特征须已 L2 归一化；逐行减 max 保数值稳定；返回标量（batch 均值）"""
+    输入特征须已 L2 归一化；逐行减 max 保数值稳定；返回标量（batch 均值）
+    标签两种形态（genscl2stage 模式新增软标签路径，论文 Eq.2 的 sim 定义为标签余弦）：
+      - int [B] 硬标签：内部 one-hot（行范数恒 1，cosine 退化为内积），genscl 模式原口径逐字节不变
+      - float [B,C] 软标签（混合标签 λ·one_hot(y_a)+(1−λ)·one_hot(y_b)）：显式 cosine 归一化
+        sim = Y·Yᵀ/(‖Y_i‖·‖Y_j‖)（官方 GenSupConLoss L36-40 同款 +1e-8 防御零范数）"""
     def __init__(self, temperature=0.07):
         super().__init__()
         self.tau = temperature
 
     def forward(self, features, labels):
         b = features.size(0)
-        y_onehot = F.one_hot(labels, num_classes=int(labels.max().item()) + 1).float()
-        sim_y = y_onehot @ y_onehot.t()                               # [B,B] 标签相似度 ∈ [0,1]，one-hot 范数恒为 1
+        if labels.dtype == torch.long:
+            y = F.one_hot(labels, num_classes=int(labels.max().item()) + 1).float()
+            sim_y = y @ y.t()                                     # [B,B] 标签相似度 ∈ [0,1]，one-hot 范数恒为 1
+        else:
+            y = labels.float()
+            norm = y.norm(dim=-1, keepdim=True)                   # [B,1] 软标签行范数（λ<1 时 <1）
+            sim_y = (y @ y.t()) / (norm * norm.t() + 1e-8)        # [B,B] cosine ∈ [0,1]（非负混合标签）
         logits = features @ features.t() / self.tau                   # [B,B] 余弦相似度/τ（特征已归一化）
         logits = logits - logits.max(dim=1, keepdim=True).values.detach()
         eye = torch.eye(b, dtype=torch.bool, device=features.device)
@@ -135,6 +146,88 @@ class GenSCLLoss(nn.Module):
         log_prob = (logits - log_denom).masked_fill(eye, 0.0)         # 对角置 0（j∈A(i) 不含自身）
         per_anchor = -(sim_y * log_prob).sum(1) / max(b - 1, 1)       # 1/|A(i)| 归一化，|A(i)|=B-1
         return per_anchor.mean()
+
+
+# ---- GenSCL 论文官方混合增广（code/GenSCL/mix.py 逐字移植，batch 级操作）----
+# 论文 3.1 框架：˜x = m(a(x))，混合在常规增广之后、batch 内配对（每批一个 λ ~ Beta(α,α)，批内 randperm）；
+# 操作对象是已归一化 tensor（官方 genscl.py：loader 出来的图先 mix 再进 encoder）。genscl2stage 模式专用
+
+def mix_fn(x, y, alpha, kind):
+    """混合分发：mixup / cutmix / mixup_cutmix（各 50% 掷币），返回 (mixed_x, y_a, y_b, lam)"""
+    if kind == 'mixup':
+        return mixup_data(x, y, alpha)
+    elif kind == 'cutmix':
+        return cutmix_data(x, y, alpha)
+    elif kind == 'mixup_cutmix':
+        if np.random.rand(1)[0] > 0.5:
+            return mixup_data(x, y, alpha)
+        else:
+            return cutmix_data(x, y, alpha)
+    else:
+        raise ValueError()
+
+
+def mix_target(y_a, y_b, lam, num_classes):
+    """混合软标签：λ·one_hot(y_a) + (1−λ)·one_hot(y_b)（论文 ˜y = m(y)，行和恒为 1）"""
+    l1 = F.one_hot(y_a, num_classes)
+    l2 = F.one_hot(y_b, num_classes)
+    return lam * l1 + (1 - lam) * l2
+
+
+def mixup_data(x, y, alpha=1.0):
+    """MixUp（Zhang et al. 2018；modified from github.com/hongyi-zhang/mixup）：像素级线性插值"""
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
+    else:
+        lam = 1
+
+    batch_size = x.size()[0]
+    index = torch.randperm(batch_size, device=x.device)
+
+    mixed_x = lam * x + (1 - lam) * x[index, :]
+    y_a, y_b = y, y[index]
+    return mixed_x, y_a, y_b, lam
+
+
+def cutmix_data(x, y, alpha=1.0):
+    """CutMix（Yun et al. 2019；modified from github.com/clovaai/CutMix-PyTorch）：随机矩形 patch 替换，
+    λ 重算为实际面积占比（保证软标签权重与像素占比一致——论文 4.4 节固定 α=β=1）"""
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
+    else:
+        lam = 1
+
+    bsz = x.size()[0]
+    index = torch.randperm(bsz, device=x.device)
+
+    bbx1, bby1, bbx2, bby2 = _rand_bbox(x.size(), lam)
+    mixed_x = x.detach().clone()
+    mixed_x[:, :, bbx1:bbx2, bby1:bby2] = mixed_x[index, :, bbx1:bbx2, bby1:bby2]
+    lam = 1 - ((bbx2 - bbx1) * (bby2 - bby1) / (x.size()[-1] * x.size()[-2]))
+
+    y_a, y_b = y, y[index]
+
+    return mixed_x, y_a, y_b, lam
+
+
+def _rand_bbox(size, lam):
+    """CutMix 随机矩形：中心均匀采样，边长 = 尺寸·√(1−λ)（np.int → int，消 NumPy 弃用告警）"""
+    W = size[2]
+    H = size[3]
+    cut_rat = np.sqrt(1. - lam)
+    cut_w = int(W * cut_rat)
+    cut_h = int(H * cut_rat)
+
+    # uniform
+    cx = np.random.randint(W)
+    cy = np.random.randint(H)
+
+    bbx1 = np.clip(cx - cut_w // 2, 0, W)
+    bby1 = np.clip(cy - cut_h // 2, 0, H)
+    bbx2 = np.clip(cx + cut_w // 2, 0, W)
+    bby2 = np.clip(cy + cut_h // 2, 0, H)
+
+    return bbx1, bby1, bbx2, bby2
 
 
 class PaCoLoss(nn.Module):
@@ -262,6 +355,18 @@ class AugPairDataset(torch.utils.data.Dataset):
 
     def __len__(self):
         return len(self.base)
+
+
+class TwoViewAugDataset(AugPairDataset):
+    """GenSCL 论文协议训练集包装（genscl2stage 专用）：同一 SimCLR 式增强管线独立采样两次，
+    返回 (增强视图1, 增强视图2, label)。与 AugPairDataset（干净 CLIP 视图 + 增强视图）不同，
+    论文 3.1 的 ˜x = m(a(x)) 要求两个视图都是 a(·) 增强视图；混合 m(·) 在 batch 级训练循环内做
+    （官方 genscl.py L87-96 同款：每批一个 λ、批内 randperm 配对，不在 Dataset 内做）"""
+
+    def __getitem__(self, item):
+        path, label = self.base.images[item]
+        img = Image.open(path).convert('RGB')
+        return self.aug(img).to(M.device), self.aug(img).to(M.device), self.base.classindex[label]
 
 
 class SupConProjector(nn.Module):
@@ -725,6 +830,144 @@ def train_twostage(args, classtype, device, trainset, valset, testset, model, fc
     M.get_features_test(testset)   # best-val 回载后的最终测试
 
 
+@torch.no_grad()
+def extract_feats(model, dataset, batch_size, device):
+    """编码整个数据集为 backbone 特征（不含 proj；genscl2stage Stage2 线性探针专用）。
+    调用方负责 model.eval() 冻结；返回 (features [N,512], labels [N])，均在 device 上"""
+    fs, ys = [], []
+    for images, labels in tqdm(DataLoader(dataset, batch_size=batch_size, shuffle=False)):
+        fs.append(M.encode_features(images.to(device)))
+        ys.append(labels.to(device))
+    return torch.cat(fs), torch.cat(ys)
+
+
+def linear_probe_eval(linear, feats, labels, log, line_prefix):
+    """预计算特征上的线性探针评估，日志格式与 M.get_features_test 对齐（驱动聚合正则兼容）：
+    '{prefix} Loss: x Acc: y macroF1: z' + PerClassF1 + 混淆矩阵；返回 acc"""
+    with torch.no_grad():
+        outputs = linear(feats)
+        loss = F.cross_entropy(outputs, labels)
+        preds = outputs.argmax(1)
+    k = outputs.size(1)
+    truth = labels.cpu().tolist()
+    pred_l = preds.cpu().tolist()
+    testResult = [[0] * k for _ in range(k)]
+    for t, p in zip(truth, pred_l):
+        testResult[t][p] += 1
+    correct = sum(testResult[i][i] for i in range(k))
+    acc = correct / len(truth)
+    f1s, macro_f1 = M.f1_from_matrix(testResult)
+    log.append('{0} Loss: {1:.4f} Acc: {2:.4f} macroF1: {3:.4f}'.format(line_prefix, loss.item(), acc, macro_f1) + '\n')
+    log.append('PerClassF1: ' + str([round(f, 4) for f in f1s]) + '\n')
+    log.append(str(testResult) + '\n')
+    print('{0} Loss: {1:.4f} Acc: {2:.4f} macroF1: {3:.4f}'.format(line_prefix, loss.item(), acc, macro_f1))
+    return acc
+
+
+def train_genscl2stage(args, classtype, device, trainset, valset, testset, model, proj, log):
+    """GenSCL 论文忠实两阶段（genscl2stage，Kim et al. arXiv:2206.00384）：
+    Stage1 = SimCLR 式双视图（TwoViewAugDataset）+ 逐视图独立混合（mix_fn，软标签）+ 纯 L_gen
+    （Eq.2 1/|A(i)| 归一化，GenSCLLoss 软标签路径）训 encoder+proj——对应论文 Table 2 "w/ CutMix" 列
+    （无 KD，α_kd=0；与官方 loss.py 的 mask.sum(1) 分母偏差刻意不同，按论文 Eq.2 为准）；
+    Stage2 = 冻结 encoder、丢弃 proj（论文 "discard g(·)"），预计算特征上训单层线性探针
+    （FCN(linear_head=True)，与 twostage 的 MLP 头不同——论文口径）。
+    与 genscl（joint 口径 CE+w·L_gen、one-hot、单视图）三点差异 = 论文 3.1 框架的三组件；
+    与 pure/twostage 差异 = 混合软标签 + 线性探针。Stage1 末轮权重（无 val 选择，twostage 同款），
+    Stage2 best-val 选线性头，FinalTest 日志走 linear_probe_eval（驱动聚合正则兼容）。
+    返回训练好的线性头（main() 用其覆盖 fc 占位 MLP，保证 save_checkpoints 存的是真实探针头）"""
+    gen_criterion = GenSCLLoss(temperature=args.temperature).to(device)
+    criterion = nn.CrossEntropyLoss()
+
+    # ---- Stage 1: 双视图混合 + 纯 L_gen（无 CE 无 warmup 冻结——对比损失直接塑形特征，twostage 同款）----
+    optimizer = torch.optim.AdamW(model.visual.parameters(), lr=args.lr_BB, weight_decay=1e-5)
+    optimizer_proj = torch.optim.Adam(proj.parameters(), lr=args.lr_FC)
+    scheduler = lr_scheduler.StepLR(optimizer, step_size=args.stepsize_BB, gamma=args.gamma_BB)
+    scheduler_proj = lr_scheduler.StepLR(optimizer_proj, step_size=args.stepsize_FC, gamma=args.gamma_FC)
+
+    loader_src = TwoViewAugDataset(trainset)
+    n_class = len(classtype)
+    for epoch in range(args.stage1_epochs):
+        running_loss = 0.0
+        seen = 0
+        for aug_q, aug_k, labels in tqdm(DataLoader(loader_src, batch_size=args.batch_size, shuffle=True)):
+            aug_q = aug_q.to(device)
+            aug_k = aug_k.to(device)
+            labels = labels.to(device)
+            optimizer.zero_grad()
+            optimizer_proj.zero_grad()
+            with torch.set_grad_enabled(True):
+                # 官方 genscl.py L87-96：两个视图各自独立混合（各自 λ 与配对）→ 软标签 → 2N batch
+                im_q, y0a, y0b, lam0 = mix_fn(aug_q, labels, args.mix_alpha, args.mix)
+                im_k, y1a, y1b, lam1 = mix_fn(aug_k, labels, args.mix_alpha, args.mix)
+                images = torch.cat([im_q, im_k], dim=0)
+                y_soft = torch.cat([mix_target(y0a, y0b, lam0, n_class),
+                                    mix_target(y1a, y1b, lam1, n_class)], dim=0).float().to(device)
+                features = M.encode_features(images)
+                loss = gen_criterion(proj(features), y_soft)
+                loss.backward()
+                M.convert_models_to_fp32(model.visual)
+                optimizer.step()
+                clip.model.convert_weights(model.visual)
+                optimizer_proj.step()
+            running_loss += loss.item() * images.size(0)
+            seen += images.size(0)
+        loginfo = 'Stage1 GenSCL Epoch:{} Loss: {:.4f}'.format(epoch, running_loss / max(seen, 1))
+        log.append(loginfo + '\n')
+        print(loginfo)
+        scheduler.step()
+        scheduler_proj.step()
+
+    # ---- Stage 2: backbone 冻结 + 丢弃 proj，预计算特征线性探针（论文 linear probe 协议）----
+    model.eval()
+    for p in model.visual.parameters():
+        p.requires_grad = False
+    # 预计算一次（eval preprocess 无增广——linear probe 标准做法；FI 18k 图一次前向数十秒，
+    # 避免 twostage 式逐轮重编码：线性头收敛快，逐轮重编码大头开销全在无谓的 backbone 前向）
+    train_feats, train_labels = extract_feats(model, trainset, args.batch_size, device)
+    val_feats, val_labels = extract_feats(model, valset, args.batch_size, device)
+    test_feats, test_labels = extract_feats(model, testset, args.batch_size, device)
+
+    linear = M.FCN(dim=512, linear_head=True).to(device)   # 论文 linear classifier（单层线性 512→K）
+    optimizer_fc = torch.optim.Adam(linear.parameters(), lr=args.lr_FC)
+    scheduler_fc = lr_scheduler.StepLR(optimizer_fc, step_size=args.stepsize_FC, gamma=args.gamma_FC)
+
+    topacc = 0.0
+    best_linear = copy.deepcopy(linear.state_dict())
+    feat_ds = TensorDataset(train_feats, train_labels)
+    for epoch in range(args.stage2_epochs):
+        running_loss = 0.0
+        running_corrects = 0
+        for feats, labels in tqdm(DataLoader(feat_ds, batch_size=args.batch_size, shuffle=True)):
+            optimizer_fc.zero_grad()
+            outputs = linear(feats)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer_fc.step()
+            running_loss += loss.item() * feats.size(0)
+            running_corrects += (outputs.argmax(1) == labels).sum().item()
+        loginfo = 'Stage2 LinearProbe Epoch:{} Loss: {:.4f} Acc: {:.4f}'.format(
+            epoch, running_loss / len(train_feats), running_corrects / len(train_feats))
+        log.append(loginfo + '\n')
+        print(loginfo)
+        scheduler_fc.step()
+
+        # 逐轮 val（best-val 选线性头）+ test 曲线（仅观察），预计算特征上秒级完成
+        epoch_accval = linear_probe_eval(linear, val_feats, val_labels, log, line_prefix='Val')
+        if epoch_accval > topacc:
+            topacc = epoch_accval
+            best_linear = copy.deepcopy(linear.state_dict())
+        log.append('Stage2 topacc: ' + str(topacc) + '\n')
+        print('Stage2 topacc: ' + str(topacc))
+        with torch.no_grad():
+            test_acc = (linear(test_feats).argmax(1) == test_labels).float().mean().item()
+        log.append('Stage2 Test@Epoch:{} Acc: {:.4f}'.format(epoch, test_acc) + '\n')
+        print('Stage2 Test@Epoch:{} Acc: {:.4f}'.format(epoch, test_acc))
+
+    linear.load_state_dict(best_linear)
+    linear_probe_eval(linear, test_feats, test_labels, log, line_prefix='Test')   # best-val 回载后的最终测试
+    return linear
+
+
 def train_pure(args, classtype, device, trainset, valset, testset, model, proj, log):
     """纯 SupCon 模式：全程无 CE 梯度，kNN 评估。训练循环同 twostage Stage1，
     每轮 val+test kNN 双评估（训练集编码一次共用），best-val 选择只看 val（test 仅观察）"""
@@ -787,7 +1030,7 @@ def main():
     parser.add_argument('--modelname', type=str, default='ViT-B/16', help='仅支持 ViT-B/16（fcdim=512）')
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--seed', type=int, default=43)
-    parser.add_argument('--mode', type=str, default='joint', choices=['joint', 'twostage', 'pure', 'genscl', 'paco', 'spread', 'pacoplus', 'mergemix', 'pacomix', 'transmix', 'vptpaco', 'vptpacoplus', 'vptpacomix', 'vptpacoplusmix', 'vptspread'],
+    parser.add_argument('--mode', type=str, default='joint', choices=['joint', 'twostage', 'pure', 'genscl', 'genscl2stage', 'paco', 'spread', 'pacoplus', 'mergemix', 'pacomix', 'transmix', 'vptpaco', 'vptpacoplus', 'vptpacomix', 'vptpacoplusmix', 'vptspread'],
                         help='joint=CE+w·SupCon 联合单循环；twostage=SupCon 预训练+CE 两阶段；'
                              'pure=纯 SupCon+kNN 评估；genscl=CE+w·GenSCL（Eq.2 复刻，骨架同 joint）；'
                              'paco=官方口径 PaCo 单损失（中心=fc 权重+BS 内嵌，无独立 CE）；'
@@ -805,7 +1048,11 @@ def main():
                              'vptpacoplusmix=VPT 冻结骨干 + CE（干净图）+ w·官方 PaCo（干净图）+ rect-mix-CE（混合图）'
                              '（vptpacoplus 甜点配置之上的 mixup 叠加单变量对照，强制 --mm_mask rect --mm_r 0）；'
                              'vptspread=VPT 冻结骨干 + THANOS L_spread（CE 干净图 + w·[(1-α)L_sup+α·cNCE] 增强视图'
-                             '对比一致性——增广只喂对比项不碰 CE 输入，与 --aug 的负结果通路不同）')
+                             '对比一致性——增广只喂对比项不碰 CE 输入，与 --aug 的负结果通路不同）；'
+                             'genscl2stage=GenSCL 论文忠实两阶段（Kim et al. arXiv:2206.00384）：Stage1 双视图 SimCLR 增广'
+                             ' + 逐视图独立混合（--mix，软标签）+ 纯 L_gen（Eq.2，1/|A(i)|，无 CE 无 KD=Table 2 w/CutMix 列）；'
+                             'Stage2 冻结 encoder 预计算特征训单层线性探针（论文 linear probe 协议，best-val 选择）——'
+                             '与 genscl（joint 口径）不可直接比，与 pure/twostage 的差异 = 混合软标签 + 线性探针')
     parser.add_argument('--knn_k', type=int, default=20, help='pure 模式 kNN 的邻居数 k')
     parser.add_argument('--num_epochs', type=int, default=25, help='joint/pure 模式总轮数')
     parser.add_argument('--stage1_epochs', type=int, default=25, help='twostage 阶段一（SupCon 预训练）轮数')
@@ -830,6 +1077,12 @@ def main():
                         help='mergemix/pacomix 混合掩码来源：attn=注意力 TopK 选区（论文原版 Eq.7）；'
                              'rect=CutMix 式随机矩形（消融对照，单变量检验"注意力选区 vs 随机选区"）；'
                              'transmix 模式强制 rect（TransMix 本体即 CutMix 框，此参数被覆盖）')
+    parser.add_argument('--mix', type=str, default='cutmix', choices=['cutmix', 'mixup', 'mixup_cutmix'],
+                        help='genscl2stage Stage1 混合方式（官方 mix.py 移植，batch 级）：'
+                             'cutmix=随机矩形 patch 替换（论文 Table 3 最强、4.4 节固定）；'
+                             'mixup=像素线性插值；mixup_cutmix=每批 50/50 掷币')
+    parser.add_argument('--mix_alpha', type=float, default=1.0,
+                        help='genscl2stage 混合比例 Beta(α,α) 参数（论文 4.4 节 α=β=1.0）')
     parser.add_argument('--lr_BB', type=float, default=1e-6)
     parser.add_argument('--lr_FC', type=float, default=1e-3)
     parser.add_argument('--stepsize_BB', type=int, default=6)
@@ -944,6 +1197,11 @@ def main():
     elif args.mode == 'twostage':
         train_twostage(args, classtype, device, trainset, valset, testset, model, fc, proj, log)
         tag = 'supcon2stage'
+    elif args.mode == 'genscl2stage':
+        # 返回线性探针头覆盖 fc 占位 MLP：save_checkpoints 存的 fc 必须是真实探针权重
+        # （test_saved_model.py 的 linear_head 自动识别靠 classifier.weight 键形态区分单层线性/MLP）
+        fc = train_genscl2stage(args, classtype, device, trainset, valset, testset, model, proj, log)
+        tag = 'supcongenscl2stage'
     else:
         train_pure(args, classtype, device, trainset, valset, testset, model, proj, log)
         tag = 'supconpure'
@@ -964,6 +1222,9 @@ def main():
                 + ' gamma_FC' + str(args.gamma_FC) + ' lr_BB:' + str(args.lr_BB) \
                 + ' stepsize_BB:' + str(args.stepsize_BB) + ' gamma_BB' + str(args.gamma_BB) \
                 + ' warmepoch:' + str(args.warmepoch) \
+                + (' mix:' + str(args.mix) + ' mix_alpha:' + str(args.mix_alpha)
+                   + ' stage1_epochs:' + str(args.stage1_epochs) + ' stage2_epochs:' + str(args.stage2_epochs)
+                   if args.mode == 'genscl2stage' else '') \
                 + (' vpt_l:' + str(args.vpt_l) if args.mode in ('vptpaco', 'vptpacoplus', 'vptpacomix', 'vptpacoplusmix', 'vptspread') else '') \
                 + (' wise_init:True' if args.wise_init else '') \
                 + (' aug:True' if args.aug else '') \

@@ -41,8 +41,9 @@ GLOB_PAT = {'Twitter1': 'ViT-B-16_Twitter1*.txt', 'Abstract7': 'ViT-B-16_Abstrac
 # 注意：日志名是 <model>_<datasetname><acc>_，故 ArtPhoto5fold 的通配与旧 ArtPhoto 单划分日志
 # （如 ViT-B-16_ArtPhoto51.85... = acc 1.85）天然无碰撞；别改成 ArtPhoto5* 这种宽通配
 # --loss 传这些名字时改走 supcon.py 后端（--mode 同名），日志 tag = supcon{mode}
-SUPCON_MODES = {'joint', 'twostage', 'pure', 'genscl', 'paco', 'spread', 'pacoplus',
+SUPCON_MODES = {'joint', 'twostage', 'pure', 'genscl', 'genscl2stage', 'paco', 'spread', 'pacoplus',
                 'mergemix', 'pacomix', 'transmix', 'vptpaco', 'vptpacoplus', 'vptpacomix', 'vptpacoplusmix', 'vptspread'}
+# 注：genscl2stage / twostage 无 Test@Epoch:24 末轮日志（两阶段协议），聚合时严格口径显示为 —
 assert DATASET in DIR_TPL, f'未知数据集 {DATASET}（支持: {list(DIR_TPL)}）'
 TAG = DATASET.lower()
 GLOB = (f'supcon{LOSS}_{DATASET}*.txt') if LOSS in SUPCON_MODES else GLOB_PAT[DATASET]
@@ -104,7 +105,9 @@ for i in FOLDS:
 print(f'\n========== {DATASET} 五折聚合（loss={LOSS}, seed 43, 25ep, 官方 val=test 协议） ==========')
 print(f'{"fold":<6}{"官方口径 FinalTest":>20}{"严格口径 ep24":>16}')
 for i, off, stc in rows:
-    print(f'{i:<6}{off:>19.2f}%{stc:>15.2f}%')
+    off_s = f'{off:.2f}%' if off is not None else '—'      # None = 无 FinalTest 行（训练失败/两阶段无末轮日志）
+    stc_s = f'{stc:.2f}%' if stc is not None else '—'      # None = 无 Test@Epoch:24（genscl2stage/twostage 两阶段协议）
+    print(f'{i:<6}{off_s:>20}{stc_s:>15}')
 import statistics as st
 ok_o = [a for a in official if a is not None]
 ok_s = [a for a in strict if a is not None]
