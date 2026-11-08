@@ -7,6 +7,7 @@
   python run_twitter1_folds.py                                  # Twitter1 ce 全 5 折
   python run_twitter1_folds.py --loss vpt                       # Twitter1 vpt 全 5 折（自动加 --vpt_l 32）
   python run_twitter1_folds.py --dataset Abstract7 --loss ce    # Abstract7 官方 5 折（abstract_5fold/fold{i}）
+  python run_twitter1_folds.py --dataset ArtPhoto5fold --loss ce    # ArtPhoto5fold 官方 5 折（artphoto_5fold/fold{i}，val=test）
   python run_twitter1_folds.py --loss paco 2 3 4 5              # 指定折号（断点续跑）
 日志归档：result/log_{dataset小写}_{loss}_fold{i}.txt（已存在则跳过归档但正常训练）
 """
@@ -32,9 +33,13 @@ while i < len(argv):
         FOLDS.append(int(argv[i])); i += 1
 FOLDS = FOLDS or [1, 2, 3, 4, 5]
 
-# 各数据集的折目录模板与日志通配
-DIR_TPL = {'Twitter1': 'twitter1_fold{i}', 'Abstract7': 'abstract_5fold/fold{i}'}
-GLOB_PAT = {'Twitter1': 'ViT-B-16_Twitter1*.txt', 'Abstract7': 'ViT-B-16_Abstract7*.txt'}
+# 各数据集的折目录模板与日志通配（ArtPhoto5fold = 官方 artphoto_partition 5-fold，main.py 走 val=test 协议）
+DIR_TPL = {'Twitter1': 'twitter1_fold{i}', 'Abstract7': 'abstract_5fold/fold{i}',
+           'ArtPhoto5fold': 'artphoto_5fold/fold{i}'}
+GLOB_PAT = {'Twitter1': 'ViT-B-16_Twitter1*.txt', 'Abstract7': 'ViT-B-16_Abstract7*.txt',
+            'ArtPhoto5fold': 'ViT-B-16_ArtPhoto5fold*.txt'}
+# 注意：日志名是 <model>_<datasetname><acc>_，故 ArtPhoto5fold 的通配与旧 ArtPhoto 单划分日志
+# （如 ViT-B-16_ArtPhoto51.85... = acc 1.85）天然无碰撞；别改成 ArtPhoto5* 这种宽通配
 # --loss 传这些名字时改走 supcon.py 后端（--mode 同名），日志 tag = supcon{mode}
 SUPCON_MODES = {'joint', 'twostage', 'pure', 'genscl', 'paco', 'spread', 'pacoplus',
                 'mergemix', 'pacomix', 'transmix', 'vptpaco', 'vptpacoplus', 'vptpacomix', 'vptpacoplusmix', 'vptspread'}

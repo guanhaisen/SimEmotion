@@ -34,6 +34,15 @@ def datasetInit(datasetname):
         # 8 类与 FI_8 同 taxonomy；prepare_artphoto.py 已把 sad 映射为 sadness
         _classtype = ['amusement', 'anger', 'awe', 'contentment', 'disgust', 'excitement', 'fear', 'sadness']
         _data_dir = args.datadir or 'D:/Coding/Python_Projects/SimEmotion/artphoto_split/'
+    elif datasetname == 'ArtPhoto5fold':
+        # 官方 artphoto_partition 5-fold（806 张，8 类与 FI_8 同 taxonomy，sad→sadness 已由
+        # prepare_artphoto_5fold.py 重命名）；artphoto_5fold/fold{i}/{train,test}/<8 类>/ 已 100%
+        # 校验与 config 一致（2026-11-07）。每折无 val → 走官方 val=test 协议（与 Twitter1/Abstract7
+        # 同款，见下方强制列表），FinalTest 即 test 峰值口径；与 ArtPhoto（单划分 best-val）不可混排。
+        # 名字带 5fold 是有意的：main.py 日志名为 <model>_<datasetname><acc>_，若叫 ArtPhoto5，
+        # 通配 ArtPhoto5* 会误匹配旧 ArtPhoto 日志（如 ArtPhoto51.85 = acc 1.85）
+        _classtype = ['amusement', 'anger', 'awe', 'contentment', 'disgust', 'excitement', 'fear', 'sadness']
+        _data_dir = args.datadir or 'D:/Coding/Python_Projects/SimEmotion/artphoto_5fold/fold1/'
     elif datasetname == 'EmotionROI':
         # 6 类；joy/surprise 不在 Mikels 8 类 → 仅支持 ce/fal（ListMLE 系与 dist_fal 会报错）
         _classtype = ['anger', 'disgust', 'fear', 'joy', 'sadness', 'surprise']
@@ -555,10 +564,11 @@ if __name__ == '__main__':
 
     # load the dataset
     trainset = Loaddata('train')
-    if args.datasetname in ('Twitter1', 'Abstract7'):
+    if args.datasetname in ('Twitter1', 'Abstract7', 'ArtPhoto5fold'):
         # 官方协议（SimEmotion code L341-344 对非 FI 数据集一律 val=test）：checkpoint 按 test 选择
         # → FinalTest 恒为 test 峰值口径，与论文直接可比；官方无末轮协议，强制禁用 --no_val 以防误用
-        # Abstract7（官方 abstract_partition 5-fold）同样按此口径（与 Twitter1 同款）
+        # Abstract7（官方 abstract_partition 5-fold）与 ArtPhoto5fold（官方 artphoto_partition 5-fold）
+        # 同样按此口径（与 Twitter1 同款）
         args.no_val = False
         valset = Loaddata('test')
     else:
