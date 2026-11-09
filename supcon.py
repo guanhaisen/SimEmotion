@@ -707,26 +707,33 @@ def train_joint(args, classtype, device, trainset, valset, testset, model, fc, p
         scheduler_fc.step()
         scheduler_proj.step()
 
-        epoch_lossval, epoch_accval = run_val(model, fc, criterion, valset, args.batch_size, device)
-        if epoch_accval > topacc:
-            topacc = epoch_accval
-            best_model = copy.deepcopy(model.state_dict())
-            best_fc = copy.deepcopy(fc.state_dict())
-            best_proj = copy.deepcopy(proj.state_dict())
-        loginfo = 'Val Epoch:{} Loss: {:.4f} Acc: {:.4f}'.format(epoch, epoch_lossval, epoch_accval)
-        log.append(loginfo + '\n')
-        log.append('topacc: ' + str(topacc) + '\n')
-        print(loginfo)
-        print('topacc: ' + str(topacc))
-        # 每轮用当前模型在测试集上评估一次（仅记录曲线，模型选择仍以 val 为准）
+        if valset is not None:
+            epoch_lossval, epoch_accval = run_val(model, fc, criterion, valset, args.batch_size, device)
+            if epoch_accval > topacc:
+                topacc = epoch_accval
+                best_model = copy.deepcopy(model.state_dict())
+                best_fc = copy.deepcopy(fc.state_dict())
+                best_proj = copy.deepcopy(proj.state_dict())
+            loginfo = 'Val Epoch:{} Loss: {:.4f} Acc: {:.4f}'.format(epoch, epoch_lossval, epoch_accval)
+            log.append(loginfo + '\n')
+            log.append('topacc: ' + str(topacc) + '\n')
+            print(loginfo)
+            print('topacc: ' + str(topacc))
+        else:
+            # --no_val 固定轮数协议：无验证集、无 best-val 选择，最后一轮权重即最终模型（main.py 同款）
+            novalinfo = 'Val skipped (--no_val): epoch {} done, last-epoch weights kept'.format(epoch)
+            log.append(novalinfo + '\n')
+            print(novalinfo)
+        # 每轮用当前模型在测试集上评估一次（仅记录曲线，模型选择仍以 val 为准，--no_val 时直接用最后一轮）
         testacc = M.get_features_test(testset)
         epoctestinfo = 'Test@Epoch:{} Acc: {:.4f}'.format(epoch, testacc)
         log.append(epoctestinfo + '\n')
         print(epoctestinfo)
 
-    model.load_state_dict(best_model)
-    fc.load_state_dict(best_fc)
-    proj.load_state_dict(best_proj)
+    if valset is not None:
+        model.load_state_dict(best_model)
+        fc.load_state_dict(best_fc)
+        proj.load_state_dict(best_proj)
     M.get_features_test(testset)   # best-val 回载后的最终测试（混淆矩阵/PerClassF1/macroF1 进日志）
 
 
@@ -1103,10 +1110,17 @@ def main():
                              '+ CLIP Normalize 管线，val/test 保持确定性 eval preprocess；'
                              '与 mixup 家族不同家族的几何增广（mixup 线已关闭不覆盖本 flag）；'
                              '实现复用 main.py Loaddata 的 train_preprocess 注入机制')
+    parser.add_argument('--no_val', action='store_true',
+                        help='固定轮数协议（main.py 同款）：不加载 val、不做 best-val 选择，训满 num_epochs 用最后一轮权重做 FinalTest'
+                             '（datadir 下无 val/ 不报错；逐轮 Test 日志仍记录仅供画曲线，不用于选模型；'
+                             '仅 train_joint 系模式支持，pure/twostage/genscl2stage 拒绝）')
     parser.add_argument('--datadir', type=str, default=None, help='数据划分目录（如 FI_seed43），结尾斜杠可省略')
     args = parser.parse_args()
     if args.datadir and not args.datadir.endswith('/'):
         args.datadir += '/'   # 路径按字符串拼接，结尾斜杠必须补齐
+    if args.no_val and args.mode not in ('joint', 'genscl', 'paco', 'spread', 'pacoplus', 'mergemix', 'pacomix',
+                                         'transmix', 'vptpaco', 'vptpacoplus', 'vptpacomix', 'vptpacoplusmix', 'vptspread'):
+        raise SystemExit('--no_val 仅支持 train_joint 系模式；pure/twostage/genscl2stage 的 best-val 选择未接线')
     if args.mode == 'transmix':
         args.mm_mask = 'rect'   # TransMix 本体 = CutMix 框；强制覆盖并使 paraminfo 如实记录
     if args.mode in ('vptpacomix', 'vptpacoplusmix'):
@@ -1121,7 +1135,7 @@ def main():
 
     # ---- 注入 main 模块全局量（顺序关键：args 先于 datasetInit）----
     M.args = types.SimpleNamespace(datasetname=args.datasetname, batch_size=args.batch_size, datadir=args.datadir,
-                                   wise_init=args.wise_init, aug=args.aug)
+                                   wise_init=args.wise_init, aug=args.aug, no_val=args.no_val)
     classtype, data_dir = M.datasetInit(args.datasetname)
     M.classtype = classtype
     M.data_dir = data_dir
@@ -1173,7 +1187,11 @@ def main():
     args.modelname = args.modelname.replace('/', '-')
 
     trainset = M.Loaddata('train')
-    if args.datasetname in ('Twitter1', 'Abstract7', 'ArtPhoto5fold'):
+    if args.no_val:
+        # --no_val 固定轮数协议（main.py 同款）：不加载 val、不做 best-val 选择，
+        # 训满 num_epochs 用最后一轮权重做 FinalTest（Emotion6 官方二划分等无 val 目录场景）
+        valset = None
+    elif args.datasetname in ('Twitter1', 'Abstract7', 'ArtPhoto5fold'):
         valset = M.Loaddata('test')   # 官方 val=test 协议（fold 目录无 val/，与 main.py 同款）
     else:
         valset = M.Loaddata('val')
@@ -1222,6 +1240,7 @@ def main():
                 + ' gamma_FC' + str(args.gamma_FC) + ' lr_BB:' + str(args.lr_BB) \
                 + ' stepsize_BB:' + str(args.stepsize_BB) + ' gamma_BB' + str(args.gamma_BB) \
                 + ' warmepoch:' + str(args.warmepoch) \
+                + (' no_val:True' if args.no_val else '') \
                 + (' mix:' + str(args.mix) + ' mix_alpha:' + str(args.mix_alpha)
                    + ' stage1_epochs:' + str(args.stage1_epochs) + ' stage2_epochs:' + str(args.stage2_epochs)
                    if args.mode == 'genscl2stage' else '') \
