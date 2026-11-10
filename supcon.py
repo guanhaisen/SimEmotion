@@ -503,6 +503,12 @@ def train_joint(args, classtype, device, trainset, valset, testset, model, fc, p
     L = CE（干净图）+ w·官方 PaCo（干净图）+ rect-mix-CE（混合图，原始 λ）；与 vptpacoplus 唯一差异 = +mix-CE，
     直接回答"增广在最优配置之上还有没有增量"（FI 全量微调上 pacomix 对 paco 为 −0.98，冻结端未测）；
     掩码/λ/r=0/零 ToMe 口径同 vptpacomix；干净图双信号（CE + w·PaCo）在冻结形态下已证非病理（vptpacoplus 臂）；
+    vptpacopluscutmix 模式（vptpacoplusmix 的 CutMix 原版对照）：与 vptpacoplusmix 唯一差异 = 混合算子
+    换 cutmix_data（Yun et al. 2019 原版：batch 级共享一个 λ~Beta(α,α) + 一个随机 box，λ 重算实际面积占比），
+    替代 build_mix rect（逐样本 λ、无 box 级联动）。其余逐字相同：CE（干净图）+ w·PaCo（干净图）+ mix-CE
+    （混合图，原始 λ 无 Eq.8）；零 ToMe 依赖（cutmix_data 是纯 tensor 操作，无补丁无注意力快照）；
+    检验"逐样本独立掩码 vs CutMix 原版单 box 共享 λ"在冻结甜点配方上的差异（预期带内——2×2 矩阵已证
+    掩码/λ̂ 来源对总量次要，本臂是第三个来源点）；
     vptspread 模式：vptpaco 冻结接线 × spread 原公式——增广只喂对比项（L_sup 自身对 + cNCE），CE 输入恒干净，
     与 --aug（抖动打在 CE 输入，冻结甜点上净负）是不同通路；双视图 AugPairDataset 照常生效，
     检验"双视图对比一致性"在冻结骨干上是否有 --aug 所没有的增益"""
@@ -511,10 +517,10 @@ def train_joint(args, classtype, device, trainset, valset, testset, model, fc, p
     spread_criterion = None
     if args.mode == 'genscl':
         supcon_criterion = GenSCLLoss(temperature=args.temperature)
-    elif args.mode in ('paco', 'pacoplus', 'pacomix', 'vptpaco', 'vptpacoplus', 'vptpacomix', 'vptpacoplusmix'):
+    elif args.mode in ('paco', 'pacoplus', 'pacomix', 'vptpaco', 'vptpacoplus', 'vptpacomix', 'vptpacoplusmix', 'vptpacopluscutmix'):
         # 类频率 q(y) = n_c/N（与 main.py wce 哨兵臂同口径），Balanced Softmax 内嵌于中心=fc 项
-        # （pacomix 复用同一 PaCoLoss 作为干净图侧的单损失；vptpaco/vptpacoplus/vptpacomix/vptpacoplusmix 与
-        # paco/pacoplus/pacomix 逐字共用同一构造路径）
+        # （pacomix 复用同一 PaCoLoss 作为干净图侧的单损失；vptpaco/vptpacoplus/vptpacomix/vptpacoplusmix/
+        # vptpacopluscutmix 与 paco/pacoplus/pacomix 逐字共用同一构造路径）
         counts = [sum(1 for _, l in trainset.images if l == c) for c in classtype]
         q = torch.tensor([n / max(sum(counts), 1) for n in counts], dtype=torch.float32)
         paco = PaCoLoss(temperature=args.temperature, alpha=args.paco_alpha,
@@ -527,7 +533,7 @@ def train_joint(args, classtype, device, trainset, valset, testset, model, fc, p
         supcon_criterion = None   # 论文纯分类口径：无对比项，proj 不参与损失
     else:
         supcon_criterion = SupConLoss(temperature=args.temperature)
-    if args.mode in ('vptpaco', 'vptpacoplus', 'vptpacomix', 'vptpacoplusmix', 'vptspread'):
+    if args.mode in ('vptpaco', 'vptpacoplus', 'vptpacomix', 'vptpacoplusmix', 'vptpacopluscutmix', 'vptspread'):
         # VPT：骨干全程冻结，backbone optimizer/scheduler 不创建（main.py vpt 臂同款）；
         # prompt 参数（requires_grad=True 仅 prompt/prompt_pos）并入 optimizer_fc 与 fc 同组更新，
         # lr 沿用 lr_FC（prompt 与 fc 头同为轻量新参数，且避免为冻结骨干引入永不步进的 AdamW 状态）
@@ -638,6 +644,19 @@ def train_joint(args, classtype, device, trainset, valset, testset, model, fc, p
                     out_mix = fc(feat_mix)
                     ce_mix = F.cross_entropy(out_mix, labels, reduction='none') * lam \
                         + F.cross_entropy(out_mix, labels[perm], reduction='none') * (1.0 - lam)
+                    loss = ce_mix.mean() + criterion(outputs, labels) \
+                        + args.supcon_weight * supcon_criterion(proj(features), labels, outputs)
+                elif args.mode == 'vptpacopluscutmix':
+                    # ---- vptpacopluscutmix：冻结骨干 + CE（干净图）+ w·PaCo（干净图）+ CutMix 原版 mix-CE（混合图）----
+                    # vptpacoplusmix 的混合算子对照：唯一差异 = cutmix_data（batch 级共享一个 λ~Beta(α,α)
+                    # + 一个随机 box，λ 重算实际面积占比）替代 build_mix rect（逐样本 λ 独立采样）。
+                    # 零 ToMe 依赖（cutmix_data 纯 tensor 操作，无补丁无 _tome_info）；原始 λ 无 Eq.8；
+                    # 干净图双信号（CE + w·PaCo）与 vptpacoplusmix 逐字相同
+                    mixed, y_a, y_b, lam = cutmix_data(images, labels, args.mm_alpha)
+                    feat_mix = M.encode_features(mixed)   # 混合图第二次前向
+                    out_mix = fc(feat_mix)
+                    ce_mix = F.cross_entropy(out_mix, y_a, reduction='none') * lam \
+                        + F.cross_entropy(out_mix, y_b, reduction='none') * (1.0 - lam)
                     loss = ce_mix.mean() + criterion(outputs, labels) \
                         + args.supcon_weight * supcon_criterion(proj(features), labels, outputs)
                 elif args.mode == 'transmix':
@@ -1037,7 +1056,7 @@ def main():
     parser.add_argument('--modelname', type=str, default='ViT-B/16', help='仅支持 ViT-B/16（fcdim=512）')
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--seed', type=int, default=43)
-    parser.add_argument('--mode', type=str, default='joint', choices=['joint', 'twostage', 'pure', 'genscl', 'genscl2stage', 'paco', 'spread', 'pacoplus', 'mergemix', 'pacomix', 'transmix', 'vptpaco', 'vptpacoplus', 'vptpacomix', 'vptpacoplusmix', 'vptspread'],
+    parser.add_argument('--mode', type=str, default='joint', choices=['joint', 'twostage', 'pure', 'genscl', 'genscl2stage', 'paco', 'spread', 'pacoplus', 'mergemix', 'pacomix', 'transmix', 'vptpaco', 'vptpacoplus', 'vptpacomix', 'vptpacoplusmix', 'vptpacopluscutmix', 'vptspread'],
                         help='joint=CE+w·SupCon 联合单循环；twostage=SupCon 预训练+CE 两阶段；'
                              'pure=纯 SupCon+kNN 评估；genscl=CE+w·GenSCL（Eq.2 复刻，骨架同 joint）；'
                              'paco=官方口径 PaCo 单损失（中心=fc 权重+BS 内嵌，无独立 CE）；'
@@ -1054,6 +1073,9 @@ def main():
                              '强制 --mm_mask rect --mm_r 0，原始 λ 无 Eq.8 重缩放）；'
                              'vptpacoplusmix=VPT 冻结骨干 + CE（干净图）+ w·官方 PaCo（干净图）+ rect-mix-CE（混合图）'
                              '（vptpacoplus 甜点配置之上的 mixup 叠加单变量对照，强制 --mm_mask rect --mm_r 0）；'
+                             'vptpacopluscutmix=vptpacoplusmix 的 CutMix 原版对照（与 vptpacoplusmix 唯一差异 = 混合算子换 '
+                             'cutmix_data：batch 级共享单 λ + 单随机 box、λ 重算面积占比，替代 build_mix rect 逐样本 λ；'
+                             '零 ToMe 依赖，原始 λ 无 Eq.8，干净图双信号逐字相同）；'
                              'vptspread=VPT 冻结骨干 + THANOS L_spread（CE 干净图 + w·[(1-α)L_sup+α·cNCE] 增强视图'
                              '对比一致性——增广只喂对比项不碰 CE 输入，与 --aug 的负结果通路不同）；'
                              'genscl2stage=GenSCL 论文忠实两阶段（Kim et al. arXiv:2206.00384）：Stage1 双视图 SimCLR 增广'
@@ -1119,7 +1141,8 @@ def main():
     if args.datadir and not args.datadir.endswith('/'):
         args.datadir += '/'   # 路径按字符串拼接，结尾斜杠必须补齐
     if args.no_val and args.mode not in ('joint', 'genscl', 'paco', 'spread', 'pacoplus', 'mergemix', 'pacomix',
-                                         'transmix', 'vptpaco', 'vptpacoplus', 'vptpacomix', 'vptpacoplusmix', 'vptspread'):
+                                         'transmix', 'vptpaco', 'vptpacoplus', 'vptpacomix', 'vptpacoplusmix',
+                                         'vptpacopluscutmix', 'vptspread'):
         raise SystemExit('--no_val 仅支持 train_joint 系模式；pure/twostage/genscl2stage 的 best-val 选择未接线')
     if args.mode == 'transmix':
         args.mm_mask = 'rect'   # TransMix 本体 = CutMix 框；强制覆盖并使 paraminfo 如实记录
@@ -1127,7 +1150,9 @@ def main():
         # 冻结骨干 mix 臂：强制 rect 掩码 + r=0。r=0 的理由：冻结骨干训练期开 ToMe 合并
         # 会造成 train（r=8 合并特征）/eval（恒 r=0）特征分布错位，且无可学习补偿；
         # Eq.8 高斯重缩放的 μ=K/L 依赖合并数，r=0 时退化为 1.0 → 用原始 λ（CutMix 原版口径），
-        # λ̂ 来源无关性已由 2×2 矩阵（Gaussian≈attention）建立，不构成掩码/λ̂ 混杂
+        # λ̂ 来源无关性已由 2×2 矩阵（Gaussian≈attention）建立，不构成掩码/λ̂ 混杂。
+        # vptpacopluscutmix 不在此列表：它用 cutmix_data 原生算子（λ/box 由该函数内部管理），
+        # mm_mask/mm_r 不参与其损失路径，保持默认值即可（paraminfo 如实回显）
         args.mm_mask = 'rect'
         args.mm_r = 0
 
@@ -1147,7 +1172,7 @@ def main():
 
     model, preprocess = clip.load(args.modelname, device)
     clip.model.convert_weights(model)
-    if args.mode in ('vptpaco', 'vptpacoplus', 'vptpacomix', 'vptpacoplusmix', 'vptspread'):
+    if args.mode in ('vptpaco', 'vptpacoplus', 'vptpacomix', 'vptpacoplusmix', 'vptpacopluscutmix', 'vptspread'):
         # VPT 包装必须在 convert_weights 之后（VPTVisual 约定：prompt 参数保持 fp32，前向 .to(x.dtype) 对齐 fp16 主干）；
         # vt 参数全部冻结，仅 prompt/prompt_pos 可训练（main.py VPTVisual 同款，经 import 注入复用）
         model.visual = M.VPTVisual(model.visual, vpt_l=args.vpt_l).to(device)
@@ -1159,6 +1184,7 @@ def main():
             # 评估循环内强制 r=0 完全退化为原始前向；trace_source 提供 MergeMix 掩码所需的 source map）；
             # vptpacomix/vptpacoplusmix 例外：rect 掩码路径不依赖注意力快照（build_mix rect 分支零补丁依赖），
             # 且冻结骨干训练期合并无意义（见 parse 处注释）→ 完全不打补丁，模型保持原始前向
+            # （vptpacopluscutmix 不进本块：cutmix_data 原生算子同样零补丁依赖）
             tome_clip.apply_patch(model.visual, r=args.mm_r, trace_source=True)
     M.preprocess = preprocess
     # --aug 训练增强（main.py wise-ft 官方管线逐字复刻）：仅训练集走 RRC 管线，
@@ -1191,7 +1217,7 @@ def main():
         # --no_val 固定轮数协议（main.py 同款）：不加载 val、不做 best-val 选择，
         # 训满 num_epochs 用最后一轮权重做 FinalTest（Emotion6 官方二划分等无 val 目录场景）
         valset = None
-    elif args.datasetname in ('Twitter1', 'Abstract7', 'ArtPhoto5fold'):
+    elif args.datasetname in ('Twitter1', 'Twitter2', 'Abstract7', 'ArtPhoto5fold'):
         valset = M.Loaddata('test')   # 官方 val=test 协议（fold 目录无 val/，与 main.py 同款）
     else:
         valset = M.Loaddata('val')
@@ -1205,13 +1231,14 @@ def main():
     print(starttime)
     startpoint = time.time()
 
-    if args.mode in ('joint', 'genscl', 'paco', 'spread', 'pacoplus', 'mergemix', 'pacomix', 'transmix', 'vptpaco', 'vptpacoplus', 'vptpacomix', 'vptpacoplusmix', 'vptspread'):
+    if args.mode in ('joint', 'genscl', 'paco', 'spread', 'pacoplus', 'mergemix', 'pacomix', 'transmix', 'vptpaco', 'vptpacoplus', 'vptpacomix', 'vptpacoplusmix', 'vptpacopluscutmix', 'vptspread'):
         train_joint(args, classtype, device, trainset, valset, testset, model, fc, proj, log)
         tag = {'joint': 'supconjoint', 'genscl': 'supcongenscl', 'paco': 'supconpaco',
                'spread': 'supconspread', 'pacoplus': 'supconpacoplus', 'mergemix': 'supconmergemix',
                'pacomix': 'supconpacomix', 'transmix': 'supcontransmix', 'vptpaco': 'supconvptpaco',
                'vptpacoplus': 'supconvptpacoplus', 'vptpacomix': 'supconvptpacomix',
-               'vptpacoplusmix': 'supconvptpacoplusmix', 'vptspread': 'supconvptspread'}[args.mode]
+               'vptpacoplusmix': 'supconvptpacoplusmix', 'vptpacopluscutmix': 'supconvptpacopluscutmix',
+               'vptspread': 'supconvptspread'}[args.mode]
     elif args.mode == 'twostage':
         train_twostage(args, classtype, device, trainset, valset, testset, model, fc, proj, log)
         tag = 'supcon2stage'
@@ -1244,7 +1271,7 @@ def main():
                 + (' mix:' + str(args.mix) + ' mix_alpha:' + str(args.mix_alpha)
                    + ' stage1_epochs:' + str(args.stage1_epochs) + ' stage2_epochs:' + str(args.stage2_epochs)
                    if args.mode == 'genscl2stage' else '') \
-                + (' vpt_l:' + str(args.vpt_l) if args.mode in ('vptpaco', 'vptpacoplus', 'vptpacomix', 'vptpacoplusmix', 'vptspread') else '') \
+                + (' vpt_l:' + str(args.vpt_l) if args.mode in ('vptpaco', 'vptpacoplus', 'vptpacomix', 'vptpacoplusmix', 'vptpacopluscutmix', 'vptspread') else '') \
                 + (' wise_init:True' if args.wise_init else '') \
                 + (' aug:True' if args.aug else '') \
                 + ' seed:' + str(args.seed) \

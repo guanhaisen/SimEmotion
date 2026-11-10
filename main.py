@@ -69,6 +69,15 @@ def datasetInit(datasetname):
         # classtype ['neg','pos'] 使 neg=0 / pos=1 与官方标签一致；ListMLE 系仅支持 8 类 Mikels，二分类不可用
         _classtype = ['neg', 'pos']
         _data_dir = args.datadir or 'D:/Coding/Python_Projects/SimEmotion/twitter1_fold1/'
+    elif datasetname == 'Twitter2':
+        # 2 类（SimEmotion Twitter II：pos 470 / neg 133 = 603 张，1:3.53 不平衡强于 Twitter I）；
+        # 官方 5-fold（config twitter603：train_{i}.txt 带标签 + partition{i}.txt test 列表）；
+        # 折目录 twitter2_fold{i}/{train,test}/{pos,neg}/ 由 prepare_twitter2.py 生成（GT/train/test
+        # 三重校验 100%）；官方每折仅覆盖 587/603 张（16 张不进任何折，官方划分原样）
+        # **官方协议**：非 FI 数据集 val=test（与 Twitter1 同款，强制禁用 --no_val）
+        # classtype ['neg','pos'] 使 neg=0 / pos=1 与官方标签一致；ListMLE 系不可用
+        _classtype = ['neg', 'pos']
+        _data_dir = args.datadir or 'D:/Coding/Python_Projects/SimEmotion/twitter2_fold1/'
     else:
         raise InputException
     return _classtype, _data_dir
@@ -564,11 +573,11 @@ if __name__ == '__main__':
 
     # load the dataset
     trainset = Loaddata('train')
-    if args.datasetname in ('Twitter1', 'Abstract7', 'ArtPhoto5fold'):
+    if args.datasetname in ('Twitter1', 'Twitter2', 'Abstract7', 'ArtPhoto5fold'):
         # 官方协议（SimEmotion code L341-344 对非 FI 数据集一律 val=test）：checkpoint 按 test 选择
         # → FinalTest 恒为 test 峰值口径，与论文直接可比；官方无末轮协议，强制禁用 --no_val 以防误用
         # Abstract7（官方 abstract_partition 5-fold）与 ArtPhoto5fold（官方 artphoto_partition 5-fold）
-        # 同样按此口径（与 Twitter1 同款）
+        # 同样按此口径（与 Twitter1/Twitter2 同款）
         args.no_val = False
         valset = Loaddata('test')
     else:

@@ -21,12 +21,13 @@
   # VPT 臂（main.py --loss vpt --vpt_l 32 训练的冻结 ViT + 可学习 prompt token）：
   python test_saved_model.py <ts> --datadir FI_seed43 --vpt --vpt_l 32
 
-  # VPT × PaCo 组合臂（supcon.py --mode vptpaco/vptpacoplus/vptpacomix/vptpacoplusmix --vpt_l 32 训练，
-  # 三件套 supconvptpaco / supconvptpacoplus / supconvptpacomix / supconvptpacoplusmix）：
+  # VPT × PaCo 组合臂（supcon.py --mode vptpaco/vptpacoplus/vptpacomix/vptpacoplusmix/vptpacopluscutmix --vpt_l 32 训练，
+  # 三件套 supconvptpaco / supconvptpacoplus / supconvptpacomix / supconvptpacoplusmix / supconvptpacopluscutmix）：
   python test_saved_model.py <ts> --tag supconvptpaco --vpt --vpt_l 32 --datadir abstract_5fold/fold1
   python test_saved_model.py <ts> --tag supconvptpacoplus --vpt --vpt_l 32 --datadir abstract_5fold/fold1
   python test_saved_model.py <ts> --tag supconvptpacomix --vpt --vpt_l 32 --datadir abstract_5fold/fold1
   python test_saved_model.py <ts> --tag supconvptpacoplusmix --vpt --vpt_l 32 --datadir abstract_5fold/fold1
+  python test_saved_model.py <ts> --tag supconvptpacopluscutmix --vpt --vpt_l 32 --datadir abstract_5fold/fold1
 
   # VPT × PaCo × zinit 组合臂（supcon.py --mode vptpacoplus --wise_init --supcon_weight 0.25 训练，
   # 单层线性头自动识别 + 特征 L2 归一化）：

@@ -34,15 +34,17 @@ while i < len(argv):
 FOLDS = FOLDS or [1, 2, 3, 4, 5]
 
 # 各数据集的折目录模板与日志通配（ArtPhoto5fold = 官方 artphoto_partition 5-fold，main.py 走 val=test 协议）
-DIR_TPL = {'Twitter1': 'twitter1_fold{i}', 'Abstract7': 'abstract_5fold/fold{i}',
+DIR_TPL = {'Twitter1': 'twitter1_fold{i}', 'Twitter2': 'twitter2_fold{i}', 'Abstract7': 'abstract_5fold/fold{i}',
            'ArtPhoto5fold': 'artphoto_5fold/fold{i}'}
-GLOB_PAT = {'Twitter1': 'ViT-B-16_Twitter1*.txt', 'Abstract7': 'ViT-B-16_Abstract7*.txt',
+GLOB_PAT = {'Twitter1': 'ViT-B-16_Twitter1*.txt', 'Twitter2': 'ViT-B-16_Twitter2*.txt',
+            'Abstract7': 'ViT-B-16_Abstract7*.txt',
             'ArtPhoto5fold': 'ViT-B-16_ArtPhoto5fold*.txt'}
 # 注意：日志名是 <model>_<datasetname><acc>_，故 ArtPhoto5fold 的通配与旧 ArtPhoto 单划分日志
 # （如 ViT-B-16_ArtPhoto51.85... = acc 1.85）天然无碰撞；别改成 ArtPhoto5* 这种宽通配
 # --loss 传这些名字时改走 supcon.py 后端（--mode 同名），日志 tag = supcon{mode}
 SUPCON_MODES = {'joint', 'twostage', 'pure', 'genscl', 'genscl2stage', 'paco', 'spread', 'pacoplus',
-                'mergemix', 'pacomix', 'transmix', 'vptpaco', 'vptpacoplus', 'vptpacomix', 'vptpacoplusmix', 'vptspread'}
+                'mergemix', 'pacomix', 'transmix', 'vptpaco', 'vptpacoplus', 'vptpacomix', 'vptpacoplusmix',
+                'vptpacopluscutmix', 'vptspread'}
 # 注：genscl2stage / twostage 无 Test@Epoch:24 末轮日志（两阶段协议），聚合时严格口径显示为 —
 assert DATASET in DIR_TPL, f'未知数据集 {DATASET}（支持: {list(DIR_TPL)}）'
 TAG = DATASET.lower()
@@ -55,7 +57,7 @@ if LOSS in SUPCON_MODES:
     BASE_CMD = [PY, 'supcon.py', '--datasetname', DATASET, '--mode', LOSS,
                 '--modelname', 'ViT-B/16', '--batch_size', '32',
                 '--num_epochs', '25', '--seed', '43']
-    if LOSS in ('vptpaco', 'vptpacoplus', 'vptpacomix', 'vptpacoplusmix', 'vptspread'):
+    if LOSS in ('vptpaco', 'vptpacoplus', 'vptpacomix', 'vptpacoplusmix', 'vptpacopluscutmix', 'vptspread'):
         BASE_CMD += ['--vpt_l', '32']
 else:
     BASE_CMD = [PY, 'main.py', '--datasetname', DATASET, '--loss', LOSS,
