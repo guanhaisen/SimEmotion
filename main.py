@@ -78,6 +78,16 @@ def datasetInit(datasetname):
         # classtype ['neg','pos'] 使 neg=0 / pos=1 与官方标签一致；ListMLE 系不可用
         _classtype = ['neg', 'pos']
         _data_dir = args.datadir or 'D:/Coding/Python_Projects/SimEmotion/twitter2_fold1/'
+    elif datasetname == 'EmoSet':
+        # 8 类 Mikels 同 FI taxonomy（EmoSet-118K：train 94,481 / val 5,905 / test 17,716 = 80/5/15）；
+        # 官方划分清单 emoset_split_json/{train,val,test}.json（2026-11-10 经 Dropbox Range 方案从
+        # EmoSet-118K.zip 精确拉取，与本地 dataset/Emoset 118,102 张 100% 校验——零缺失零标签冲突）；
+        # 折目录 emoset_split/{train,val,test}/<小写类名>/ 由 prepare_emoset.py 生成（三划分互斥）
+        # 有 val/ → 走标准 best-val 协议（与 FI 官方划分同款）；八类均衡（BS 校正无操作）
+        # 8 类全小写与 FI_8 classtype 字母序一致（amusement,anger,awe,contentment,disgust,excitement,fear,sadness）
+        # 训练成本：94k train ≈ FI 5 倍 → 25ep 全量 ~10h/臂（建议先 2ep 冒烟测吞吐）
+        _classtype = ['amusement', 'anger', 'awe', 'contentment', 'disgust', 'excitement', 'fear', 'sadness']
+        _data_dir = args.datadir or 'D:/Coding/Python_Projects/SimEmotion/emoset_split/'
     else:
         raise InputException
     return _classtype, _data_dir
